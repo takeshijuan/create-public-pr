@@ -1,11 +1,38 @@
 from __future__ import annotations
 
 import json
+import inspect
 import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
+from typing import Any, Callable
 
-import pytest
+
+class _Mark:
+    @staticmethod
+    def parametrize(
+        argnames: str | tuple[str, ...], argvalues: list[Any]
+    ) -> Callable[[Callable[..., None]], Callable[..., None]]:
+        names = (
+            tuple(name.strip() for name in argnames.split(","))
+            if isinstance(argnames, str)
+            else tuple(argnames)
+        )
+
+        def decorate(function: Callable[..., None]) -> Callable[..., None]:
+            setattr(function, "_parameter_cases", (names, tuple(argvalues)))
+            return function
+
+        return decorate
+
+
+class _PytestStyle:
+    mark = _Mark()
+
+
+pytest = _PytestStyle()
 
 
 SCRIPT = (
@@ -992,3 +1019,52 @@ def test_merge_does_not_reclassify_base_content_retained_from_one_parent(
     assert result.returncode == 0
     assert json.loads(result.stdout)["findings"] == []
     assert secret not in result.stdout
+
+
+def _test_case(
+    name: str,
+    function: Callable[..., None],
+    parameter_names: tuple[str, ...],
+    values: Any,
+    case_index: int | None,
+) -> unittest.FunctionTestCase:
+    if parameter_names:
+        parameter_values = (values,) if len(parameter_names) == 1 else tuple(values)
+        parameters = dict(zip(parameter_names, parameter_values))
+    else:
+        parameters = {}
+
+    def run() -> None:
+        arguments = dict(parameters)
+        if "tmp_path" in inspect.signature(function).parameters:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                arguments["tmp_path"] = Path(temporary_directory)
+                function(**arguments)
+        else:
+            function(**arguments)
+
+    suffix = "" if case_index is None else f"[{case_index}]"
+    run.__name__ = f"{name}{suffix}"
+    return unittest.FunctionTestCase(run, description=run.__name__)
+
+
+def load_tests(
+    loader: unittest.TestLoader,
+    standard_tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    del loader, standard_tests, pattern
+    suite = unittest.TestSuite()
+    for name, function in list(globals().items()):
+        if not name.startswith("test_") or not callable(function):
+            continue
+        parameter_cases = getattr(function, "_parameter_cases", None)
+        if parameter_cases is None:
+            suite.addTest(_test_case(name, function, (), (), None))
+            continue
+        parameter_names, cases = parameter_cases
+        for case_index, values in enumerate(cases):
+            suite.addTest(
+                _test_case(name, function, parameter_names, values, case_index)
+            )
+    return suite

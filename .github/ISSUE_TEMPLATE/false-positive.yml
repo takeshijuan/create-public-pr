@@ -1,0 +1,40 @@
+name: Scanner false positive
+description: Report a suspected false positive without revealing the matched value.
+title: "scanner: false positive for "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: Never paste the matched value. Report only the category, severity, source kind, safe path identifier, and safe commit identifier.
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - credential
+        - private-key
+        - credential-url
+        - collaboration-url
+        - private-host
+        - local-path
+        - email
+        - external-tracker
+        - repository-link
+        - identity
+        - binary
+        - symlink
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source kind
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Public-safe explanation
+      description: Explain the expected classification without quoting the match.
+    validations:
+      required: true

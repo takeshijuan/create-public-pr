@@ -1,0 +1,45 @@
+# create-public-pr
+
+`create-public-pr` is a portable Agent Skill for preparing or refreshing a privacy-safe public pull request. It combines exact scope control, a redacting standard-library Python scanner, explicit validation gates, and draft-first GitHub CLI commands.
+
+## Install
+
+Replace `YOUR_GITHUB_OWNER` with the public repository owner:
+
+```sh
+npx skills@latest add YOUR_GITHUB_OWNER/create-public-pr --skill create-public-pr
+```
+
+Inspect the skill in a local checkout without installing it:
+
+```sh
+npx skills@latest add . --list
+```
+
+User-facing installation commands intentionally track the latest CLI. Continuous integration pins repository discovery for reproducibility:
+
+```sh
+npx --yes skills@1.5.17 add . --list
+```
+
+## What it enforces
+
+- Explicit public-PR requests only; review-only, commit-only, merge, issue, and deployment requests do not trigger it.
+- Complete history and worktree scanning without printing matched sensitive values.
+- Exact staging, repository-local GitHub noreply identity, normal pushes, draft creation, and existing-PR refresh.
+- No implicit reviewers, labels, projects, milestones, merges, deployments, history rewrites, or force-pushes.
+- A stricter `locked-down` profile for future-public or no-internal-links repositories.
+
+The scanner uses only the Python standard library at runtime and supports Python 3.10 and newer.
+
+## Validate a checkout
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 scripts/validate_skill.py --repo .
+npx --yes skills@1.5.17 add . --list
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

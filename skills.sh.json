@@ -1,0 +1,11 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "Git & Pull Requests",
+      "description": "Portable workflows for preparing privacy-safe public pull requests.",
+      "skills": ["create-public-pr"]
+    }
+  ]
+}

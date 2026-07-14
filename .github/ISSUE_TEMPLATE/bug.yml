@@ -1,0 +1,35 @@
+name: Bug report
+description: Report incorrect behavior using public-safe placeholder data.
+title: "bug: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private links, personal addresses, local paths, or proprietary context.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Public-safe reproduction
+      description: Use harmless placeholders and minimal steps.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
