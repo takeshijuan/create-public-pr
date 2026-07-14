@@ -1,13 +1,13 @@
 # create-public-pr
 
+[![skills.sh](https://skills.sh/b/takeshijuan/create-public-pr)](https://skills.sh/takeshijuan/create-public-pr)
+
 `create-public-pr` is a portable Agent Skill for preparing or refreshing a privacy-safe public pull request. It combines exact scope control, a redacting standard-library Python scanner, explicit validation gates, and draft-first GitHub CLI commands.
 
 ## Install
 
-Replace `YOUR_GITHUB_OWNER` with the public repository owner:
-
 ```sh
-npx skills@latest add YOUR_GITHUB_OWNER/create-public-pr --skill create-public-pr
+npx skills@latest add takeshijuan/create-public-pr --skill create-public-pr
 ```
 
 Inspect the skill in a local checkout without installing it:

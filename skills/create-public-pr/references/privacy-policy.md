@@ -22,31 +22,32 @@ Credentials, private keys, credential-bearing URLs, collaboration-tool URLs, pri
 
 ## Manual-review evidence
 
-Only `repository-link` under `community`, `binary`, and `identity` findings are eligible for manual resolution. Store a JSON array at `.git/public-pr-review.json`, keep it out of commits, and create one object per finding without including the matched value:
+Only `repository-link` under `community`, `binary`, and `identity` findings are eligible for manual resolution. Store a JSON array at `.git/public-pr-review.json`, keep it out of commits, and create one object per finding without including the matched value. Include `commit` and `path_id` if and only if the finding contains them:
 
 ```json
 [
   {
-    "category": "repository-link | binary | identity",
+    "category": "repository-link",
     "severity": "review",
     "source": "scanner source kind",
-    "safe_identifier": "path_id or commit identifier",
+    "commit": "0123456789ab",
+    "path_id": "abcdef012345",
     "checks": {
-      "public_without_credentials": "pass | not-applicable",
-      "relevant_to_change": "pass | not-applicable",
+      "public_without_credentials": "pass",
+      "relevant_to_change": "pass",
       "no_internal_context": "pass",
-      "provenance_and_license": "pass | not-applicable"
+      "provenance_and_license": "not-applicable"
     },
-    "decision": "approved | remove | replace",
+    "decision": "approved",
     "reviewer": "accountable role",
     "rationale": "public-safe summary without the matched value"
   }
 ]
 ```
 
-For a community repository link, independently confirm public access without private credentials, direct relevance, and absence of internal context. For a binary, verify its provenance, license, intended contents, and public-safe source without printing extracted strings. For an identity, record explicit acceptance or replace the commit through an authorized clean-branch strategy; never expose the address.
+For a community repository link, independently confirm public access without private credentials, direct relevance, and absence of internal context. For a binary, set the first two checks to `not-applicable`, verify no internal context plus provenance/license, and avoid printing extracted strings. For an identity, only the no-internal-context check is `pass`; the other checks are `not-applicable`. If the decision is remove or replace, remediate and rerun the audit instead of retaining a record. Never expose an address.
 
-An assertion of harmlessness, a successful page load with private credentials, or a clean final diff is not evidence. The workflow must parse the audit and review JSON, reject blocking findings, and match every eligible finding to exactly one complete record before continuing. If verification is inconclusive, remove or replace the material.
+An assertion of harmlessness, a successful page load with private credentials, or a clean final diff is not evidence. The standard-library comparator rejects every blocking finding and matches the exact one-to-one set of eligible findings by category, severity, source, commit when present, and path identifier when present. Duplicate, unexpected, stale, missing, or invalid records stop the workflow. If verification is inconclusive, remove or replace the material.
 
 ## History and scope boundaries
 

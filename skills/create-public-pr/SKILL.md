@@ -15,9 +15,9 @@ Read [privacy-policy.md](references/privacy-policy.md) before resolving findings
 
 1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, default base, working tree, existing branch commits, and any open PR for the head branch. Stop on detached HEAD, an ambiguous PR, an unexpected base, or incomplete repository access.
 2. **Scope.** Name the intended change and obtain an explicit path or hunk boundary. Treat staged and untracked content as observations, not authorization. If approved and unrelated changes are mixed, stop and confirm the exact scope; do not use stash, reset, restore, or destructive index manipulation to separate it without authorization.
-3. **Branch.** Use a focused non-default branch with only related commits. When branch creation is needed and the repository has no stronger naming convention, use `codex/<short-description>`. If sensitive material exists in published history, do not amend, rebase, reset, or force-push. Stop before changing PR strategy; a clean replacement branch and replacement PR require explicit user authorization.
+3. **Branch.** Enforce a focused non-default branch with only related commits. When the current branch is the base, create a branch using the repository convention or `codex/<short-description>`. Require the branch to differ from the base and `origin/$base` to be an ancestor of `HEAD`. If sensitive material exists in published history, do not amend, rebase, reset, or force-push. Stop before changing PR strategy; a clean replacement branch and replacement PR require explicit user authorization.
 4. **Prepare.** Follow the repository template. Write the title, body, commit message, confirmed repo-relative paths, audit output, and manual-review records to files inside `.git/`. Follow the repository's commit convention; when none exists, use Conventional Commits. Resolve the skill directory from the loaded `SKILL.md`; never assume the target repository contains the scanner. Select `locked-down` when repository instructions say future-public, no-internal-links, or equivalent; otherwise select `community`.
-5. **Audit.** Run the scanner exactly as shown below. Exit 2 or an incomplete result is a hard stop. Exit 1 requires remediation or a complete manual-review record; never weaken the profile, omit inputs, or substitute commands that print matched values.
+5. **Audit.** Run the scanner and audit/review comparator exactly as shown below. Exit 2 or an incomplete result is a hard stop. Exit 1 may continue only after a review file exists and the comparator proves an exact record for every eligible finding and no blocking finding; never weaken the profile, omit inputs, or substitute commands that print matched values.
 6. **Validate.** Run the repository's relevant tests and checks. Resolve every blocking finding. Resolve each review finding using the evidence contract in the privacy reference.
 7. **Stage.** Stage only confirmed paths or hunks with explicit pathspecs. Compare the staged set to the approved scope without printing raw paths, then run `git diff --cached --check`. Never use broad staging for a mixed worktree.
 8. **Commit and re-audit.** Require repository-local GitHub noreply identity. Commit only the verified index, then audit the complete base-to-HEAD range and proposed PR text again.
@@ -38,7 +38,7 @@ Read [privacy-policy.md](references/privacy-policy.md) before resolving findings
 
 ## Complete adaptable command sequence
 
-Replace the angle-bracket path lists with the confirmed repository-relative paths. Keep proposal files under `.git/` so they cannot be committed accidentally.
+Replace the angle-bracket path lists with the confirmed repository-relative paths and replace `short-description` with the focused branch slug. Keep proposal files under `.git/` so they cannot be committed accidentally.
 
 ```sh
 repo_root=$(git rev-parse --show-toplevel) || exit 2
@@ -59,11 +59,20 @@ case "$pr_count" in
   *) exit 2 ;;
 esac
 git fetch origin "$base" || exit 2
+git merge-base --is-ancestor "origin/$base" HEAD || exit 2
+if test "$branch" = "$base"; then
+  branch_name="codex/short-description"
+  git switch -c "$branch_name" || exit 2
+  branch="$branch_name"
+fi
+test "$branch" != "$base" || exit 2
 
 profile=community
 skill_root=${CREATE_PUBLIC_PR_SKILL_DIR:?set to the directory containing the loaded SKILL.md}
 scanner="$skill_root/scripts/audit_public_pr.py"
+comparator="$skill_root/scripts/validate_audit_review.py"
 test -f "$scanner" || exit 2
+test -f "$comparator" || exit 2
 paths_file="$repo_root/.git/public-pr-paths.txt"
 title_file="$repo_root/.git/public-pr-title.txt"
 body_file="$repo_root/.git/public-pr-body.md"
@@ -81,13 +90,19 @@ python3 "$scanner" \
   --body-file "$body_file" --commit-message-file "$commit_message_file" \
   --format json > "$audit_file"
 audit_status=$?
-case "$audit_status" in 0) printf '%s\n' '[]' > "$review_file" ;; 1) : ;; *) exit 2 ;; esac
+case "$audit_status" in
+  0) printf '%s\n' '[]' > "$review_file" ;;
+  1) test -f "$review_file" || exit 2 ;;
+  *) exit 2 ;;
+esac
+python3 "$comparator" --audit-file "$audit_file" --review-file "$review_file" || exit 2
 
 git add -- <confirmed-paths>
 git add -p -- <confirmed-partial-paths>
 git diff --cached --name-only > "$staged_file"
 python3 -c 'import pathlib,sys; expected=set(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()); actual=set(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()); raise SystemExit(0 if expected == actual else 2)' "$paths_file" "$staged_file" || exit 2
 if ! git diff --cached --check > "$diff_check_file" 2>&1; then printf '%s\n' 'staged diff check failed'; exit 2; fi
+git config --local --get user.name | grep -Eq '[^[:space:]]' || exit 2
 git config --local --get user.email | grep -Eq '@users\.noreply\.github\.com$' || exit 2
 git commit --quiet -F "$commit_message_file" || exit 2
 
@@ -97,12 +112,17 @@ python3 "$scanner" \
   --body-file "$body_file" --commit-message-file "$commit_message_file" \
   --format json > "$audit_file"
 audit_status=$?
-case "$audit_status" in 0) printf '%s\n' '[]' > "$review_file" ;; 1) : ;; *) exit 2 ;; esac
+case "$audit_status" in
+  0) printf '%s\n' '[]' > "$review_file" ;;
+  1) test -f "$review_file" || exit 2 ;;
+  *) exit 2 ;;
+esac
+python3 "$comparator" --audit-file "$audit_file" --review-file "$review_file" || exit 2
 
 git push -u origin "$branch" || exit 2
 ```
 
-When audit exit 1 contains only eligible review findings, write the records defined in the privacy reference to `public-pr-review.json`, then validate a one-to-one record for every review finding and no blocking findings. The validation must parse both JSON files with Python's standard library, compare `category`, `source`, and safe `path_id` or commit identifier, require every record field, and exit 2 on any mismatch. Do this after each audit before continuing; an assertion without the file and check is not resolution.
+When audit exit 1 contains only eligible review findings, pause to write the records defined in the privacy reference to `public-pr-review.json`, then resume at the comparator. It compares the exact full key: `category`, `severity`, `source`, plus `commit` and `path_id` whenever present. It rejects blocking findings, duplicates, unexpected/stale/missing records, invalid checks, and non-approved decisions without echoing values. Run it after each audit; an assertion without the file and successful comparator is not resolution.
 
 After the open-PR query returns exactly one result, set its number and refresh it:
 

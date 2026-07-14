@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,9 @@ REQUIRED_FILES = (
     "skills/create-public-pr/references/pr-writing.md",
     "skills/create-public-pr/references/privacy-policy.md",
     "skills/create-public-pr/scripts/audit_public_pr.py",
+    "skills/create-public-pr/scripts/validate_audit_review.py",
     "tests/test_audit_public_pr.py",
+    "tests/test_validate_audit_review.py",
     "tests/test_validate_skill.py",
 )
 
@@ -100,7 +103,7 @@ def validate_frontmatter_and_references(skill: str, errors: list[str]) -> None:
     for trigger in ("create", "open", "prepare", "publish", "refresh"):
         if trigger not in description.lower():
             errors.append(f"skill description lacks positive trigger: {trigger}")
-    for negative in ("review-only", "commit-only", "merge", "deployment"):
+    for negative in ("review-only", "commit-only", "issue", "merge", "deployment"):
         if negative not in description.lower():
             errors.append(f"skill description lacks negative trigger: {negative}")
 
@@ -155,8 +158,18 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
     )
     if 'scanner="$skill_root/scripts/audit_public_pr.py"' not in skill:
         errors.append("portable installed scanner path is missing")
+    if 'comparator="$skill_root/scripts/validate_audit_review.py"' not in skill:
+        errors.append("portable installed comparator path is missing")
     if 'python3 "$scanner"' not in skill:
         errors.append("exact scanner invocation is missing")
+    comparator_call = (
+        'python3 "$comparator" --audit-file "$audit_file" '
+        '--review-file "$review_file" || exit 2'
+    )
+    if skill.count(comparator_call) != 2:
+        errors.append("audit/review comparator must run after both scans")
+    if re.search(r"\b1\)\s*:\s*;;", skill):
+        errors.append("audit exit 1 must not bypass review validation")
     for option in scanner_options:
         if option not in skill:
             errors.append(f"scanner invocation missing option: {option}")
@@ -190,12 +203,30 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
         errors.append("default branch naming contract is missing")
     if "Conventional Commits" not in skill:
         errors.append("default commit convention is missing")
+    ancestry = 'git merge-base --is-ancestor "origin/$base" HEAD || exit 2'
+    branch_create = 'git switch -c "$branch_name" || exit 2'
+    branch_compare = 'test "$branch" != "$base" || exit 2'
+    if branch_create not in skill:
+        errors.append("focused branch creation contract is missing")
+    if branch_compare not in skill:
+        errors.append("branch must differ from base")
+    if ancestry not in skill:
+        errors.append("base ancestry contract is missing")
+    elif branch_create in skill and skill.index(ancestry) > skill.index(branch_create):
+        errors.append("base ancestry must be checked before fallback branch creation")
+    if "git config --local --get user.name | grep -Eq '[^[:space:]]' || exit 2" not in skill:
+        errors.append("repository-local user.name check is missing")
+    if (
+        "git config --local --get user.email "
+        "| grep -Eq '@users\\.noreply\\.github\\.com$' || exit 2"
+    ) not in skill:
+        errors.append("repository-local noreply email check is missing")
     for contract in (
         'base=$(gh pr view "$pr_number" --json baseRefName',
         'pr_head=$(gh pr view "$pr_number" --json headRefName',
         'existing_is_draft=$(gh pr view "$pr_number" --json isDraft',
         'review_file="$repo_root/.git/public-pr-review.json"',
-        "compare `category`, `source`, and safe `path_id` or commit identifier",
+        "exact full key: `category`, `severity`, `source`, plus `commit` and `path_id` whenever present",
         'git diff --cached --name-only > "$staged_file"',
     ):
         if contract not in skill:
@@ -266,6 +297,59 @@ def validate_evals(repo: Path, errors: list[str]) -> None:
             errors.append(f"evals require {kind} cases")
     if sum(1 for case in evals if isinstance(case, dict) and case.get("kind") == "workflow-pressure") < 3:
         errors.append("evals require at least three workflow-pressure cases")
+    text_by_kind: dict[str, str] = {}
+    for kind in kinds:
+        parts: list[str] = []
+        for case in evals:
+            if not isinstance(case, dict) or case.get("kind") != kind:
+                continue
+            parts.extend(
+                str(case.get(field, ""))
+                for field in ("prompt", "expected_output")
+            )
+            expectations = case.get("expectations", [])
+            if isinstance(expectations, list):
+                parts.extend(str(expectation) for expectation in expectations)
+        text_by_kind[kind] = " ".join(parts).lower()
+    positive_markers = (
+        "create",
+        "open",
+        "prepare",
+        "publish",
+        "refresh",
+        "public-safe",
+    )
+    if not all(
+        marker in text_by_kind.get("routing-positive", "")
+        for marker in positive_markers
+    ):
+        errors.append("routing-positive eval trigger coverage is incomplete")
+    negative_markers = (
+        "review-only",
+        "commit-only",
+        "issue-only",
+        "merge",
+        "deployment",
+    )
+    if not all(
+        marker in text_by_kind.get("routing-negative", "")
+        for marker in negative_markers
+    ):
+        errors.append("routing-negative eval trigger coverage is incomplete")
+    pressure_markers = (
+        "locked-down profile",
+        "does not amend, rebase, reset, or force-push",
+        "authorizes the strategy change",
+        "exact scope or clean worktree",
+        "does not use broad staging, stash, reset, or restore",
+        "one-to-one audit/review comparator",
+        "external repository link as blocking",
+    )
+    if not all(
+        marker in text_by_kind.get("workflow-pressure", "")
+        for marker in pressure_markers
+    ):
+        errors.append("workflow-pressure eval expectations are incomplete")
 
 
 def validate_registry(repo: Path, errors: list[str]) -> None:
@@ -288,11 +372,18 @@ def validate_registry(repo: Path, errors: list[str]) -> None:
 def validate_readme_and_ci(repo: Path, errors: list[str]) -> None:
     readme = read_text(repo, README_PATH, errors)
     user_install = (
-        "npx skills@latest add YOUR_GITHUB_OWNER/create-public-pr "
+        "npx skills@latest add takeshijuan/create-public-pr "
         "--skill create-public-pr"
     )
     if user_install not in readme:
         errors.append("README installation must use skills@latest")
+        errors.append("README installation must use the public repository")
+    badge = (
+        "[![skills.sh](https://skills.sh/b/takeshijuan/create-public-pr)]"
+        "(https://skills.sh/takeshijuan/create-public-pr)"
+    )
+    if badge not in readme:
+        errors.append("README official skills.sh badge is missing")
     if "npx skills@latest add . --list" not in readme:
         errors.append("README local discovery must use skills@latest")
     pinned = "npx --yes skills@1.5.17 add . --list"
@@ -316,19 +407,38 @@ def validate_readme_and_ci(repo: Path, errors: list[str]) -> None:
 
 
 def validate_public_content(repo: Path, errors: list[str]) -> None:
-    signature_fixtures = {
-        "skills/create-public-pr/scripts/audit_public_pr.py",
-        "tests/test_audit_public_pr.py",
+    excluded_directories = {
+        ".git",
+        ".superpowers",
+        ".pytest_cache",
+        "__pycache__",
+        "node_modules",
+        "htmlcov",
     }
-    forbidden_literals = (
-        "/" + "Users/",
-        "/" + "home/",
-        "file:" + "///",
-        "local" + "host",
-        "." + "internal",
-        "slack." + "com/",
-        "notion." + "so/",
-        "clickup." + "com/",
+    excluded_files = {".coverage", ".DS_Store"}
+    local_marker_pattern = re.compile(
+        r"(?:^|[\s'\"(])/(?:"
+        + r"Users|home"
+        + r")/[^\s'\"`]+|"
+        + "file:"
+        + r"///[^\s'\"`]+|"
+        + r"(?<![A-"
+        + r"Z0"
+        + r"-9])[A-Z]:[\\/](?:[^\s\\/]+[\\/])+[^\s\\/]+",
+        re.I,
+    )
+    private_url_pattern = re.compile(
+        r"https?://(?:[^\s/]+\.)?(?:"
+        + r"local"
+        + r"host|[^\s/]+\.in"
+        + r"ternal|slack\."
+        + r"com|notion\.so|clickup\.com"
+        r")(?:/[^\s]*)?",
+        re.I,
+    )
+    private_host_pattern = re.compile(
+        r"\b(?:local" + r"host|[a-z0-9.-]+\.in" + r"ternal)\b",
+        re.I,
     )
     email_pattern = re.compile(
         r"\b[A-"
@@ -339,21 +449,70 @@ def validate_public_content(repo: Path, errors: list[str]) -> None:
         + r"Z]{2,})\b",
         re.I,
     )
-    for relative_path in REQUIRED_FILES:
-        if relative_path in signature_fixtures:
+    public_files: list[Path] = []
+    for root, directories, filenames in os.walk(repo):
+        directories[:] = [
+            directory
+            for directory in directories
+            if directory not in excluded_directories
+        ]
+        root_path = Path(root)
+        for filename in filenames:
+            if filename in excluded_files:
+                continue
+            public_files.append(root_path / filename)
+    def intentional_detector_line(relative_path: str, line: str) -> bool:
+        stripped = line.strip()
+        return (
+            relative_path == "skills/create-public-pr/scripts/audit_public_pr.py"
+            and (
+                stripped.startswith('r"(?i)(?:file:///')
+                or "(?i:\\bBearer" in stripped
+                or stripped.startswith("LOCAL_HOST_RE = re.compile")
+            )
+        ) or (
+            relative_path == "scripts/validate_skill.py"
+            and stripped.startswith('r"file:///')
+        ) or (
+            relative_path == "tests/test_audit_public_pr.py"
+            and ('"http://" + "local' + "host") in stripped
+        )
+
+    for path in sorted(public_files):
+        relative_path = path.relative_to(repo).as_posix()
+        if path.is_symlink():
+            errors.append(f"public content file must not be a symlink: {relative_path}")
             continue
-        text = read_text(repo, relative_path, errors)
-        lowered = text.lower()
-        for literal in forbidden_literals:
-            if literal.lower() in lowered:
-                errors.append(f"public content contains internal/local marker: {relative_path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            errors.append("public content must be UTF" + f"-8 text: {relative_path}")
+            continue
+        for line in text.splitlines():
+            if (
+                local_marker_pattern.search(line)
+                or private_url_pattern.search(line)
+                or private_host_pattern.search(line)
+            ) and not intentional_detector_line(relative_path, line):
+                errors.append(
+                    f"public content contains internal/local marker: {relative_path}"
+                )
                 break
         for match in email_pattern.finditer(text):
             address = match.group(0).lower()
             domain = match.group(1).lower()
+            if address in {
+                "git@" + "github.com",
+                "git@" + "gitlab.com",
+                "git@" + "bitbucket.org",
+                "noreply@" + "github.com",
+            }:
+                continue
             if address.endswith("@users.noreply.github.com"):
                 continue
             if domain in {"example.com", "example.net", "example.org"}:
+                continue
+            if domain.endswith((".example", ".invalid", ".test")):
                 continue
             if "\\" in address:
                 continue
@@ -364,8 +523,6 @@ def validate_public_content(repo: Path, errors: list[str]) -> None:
 def validate(repo: Path) -> list[str]:
     errors: list[str] = []
     validate_required_files(repo, errors)
-    if errors:
-        return sorted(set(errors))
     skill = read_text(repo, SKILL_PATH, errors)
     validate_frontmatter_and_references(skill, errors)
     validate_workflow_contract(skill, errors)

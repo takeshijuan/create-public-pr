@@ -26,6 +26,18 @@
       ]
     },
     {
+      "id": 8,
+      "kind": "routing-positive",
+      "prompt": "Create and publish a public-safe pull request for this focused change.",
+      "expected_output": "The skill loads for explicit create and publish intent and opens one verified draft.",
+      "files": [],
+      "expectations": [
+        "Loads create-public-pr for explicit create and publish language",
+        "Requires a focused non-default branch and complete audit gates",
+        "Creates one draft with explicit base, head, title, and body file"
+      ]
+    },
+    {
       "id": 3,
       "kind": "routing-negative",
       "prompt": "Review this pull request and report any correctness issues. Do not change it.",
@@ -45,6 +57,18 @@
       "expectations": [
         "Respects the no-PR boundary",
         "Does not invoke public PR creation or refresh commands"
+      ]
+    },
+    {
+      "id": 9,
+      "kind": "routing-negative",
+      "prompt": "Create an issue, merge the current pull request, and deploy it. Do not prepare or refresh a public PR.",
+      "expected_output": "Issue-only, merge, and deployment requests do not load the skill.",
+      "files": [],
+      "expectations": [
+        "Issue-only, merge, and deployment requests do not load the skill",
+        "Does not create or refresh a pull request",
+        "Does not merge or deploy"
       ]
     },
     {
@@ -80,7 +104,8 @@
       "expectations": [
         "Automatically selects the locked-down profile",
         "Treats the external repository link as blocking",
-        "Uses the standardized manual-review record for binary and identity findings without revealing values"
+        "Uses the one-to-one audit/review comparator for binary and identity findings without revealing values",
+        "Rejects every blocking finding, duplicate, stale, unexpected, or missing review record"
       ]
     }
   ]

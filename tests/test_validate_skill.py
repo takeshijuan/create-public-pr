@@ -179,6 +179,144 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             self.assertIn("staged diff check must capture raw path output", result.stdout)
             self.assertIn("commit command must suppress the file summary", result.stdout)
 
+    def test_comparator_is_required_after_both_audits(self) -> None:
+        with self.copied_repository() as repo:
+            skill_path = repo / "skills/create-public-pr/SKILL.md"
+            content = skill_path.read_text(encoding="utf-8")
+            comparator_call = (
+                'python3 "$comparator" --audit-file "$audit_file" '
+                '--review-file "$review_file" || exit 2'
+            )
+            content = content.replace(comparator_call, "printf 'skip comparator'", 1)
+            skill_path.write_text(content, encoding="utf-8")
+
+            self.assert_invalid(repo, "audit/review comparator must run after both scans")
+
+    def test_branch_safety_contract_is_required(self) -> None:
+        with self.copied_repository() as repo:
+            skill_path = repo / "skills/create-public-pr/SKILL.md"
+            content = skill_path.read_text(encoding="utf-8")
+            content = content.replace(
+                'git switch -c "$branch_name" || exit 2',
+                "printf 'skip focused branch'",
+            )
+            content = content.replace(
+                'test "$branch" != "$base" || exit 2',
+                "printf 'skip branch comparison'",
+            )
+            content = content.replace(
+                'git merge-base --is-ancestor "origin/$base" HEAD || exit 2',
+                "printf 'skip ancestry check'",
+            )
+            skill_path.write_text(content, encoding="utf-8")
+
+            result = self.run_validator(repo)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("focused branch creation contract is missing", result.stdout)
+            self.assertIn("branch must differ from base", result.stdout)
+            self.assertIn("base ancestry contract is missing", result.stdout)
+
+    def test_repository_local_name_and_noreply_email_are_required(self) -> None:
+        with self.copied_repository() as repo:
+            skill_path = repo / "skills/create-public-pr/SKILL.md"
+            content = skill_path.read_text(encoding="utf-8")
+            content = content.replace(
+                "git config --local --get user.name | grep -Eq '[^[:space:]]' || exit 2",
+                "printf 'skip local name'",
+            )
+            skill_path.write_text(content, encoding="utf-8")
+
+            self.assert_invalid(repo, "repository-local user.name check is missing")
+
+    def test_public_content_scan_covers_future_files(self) -> None:
+        markers = (
+            "/" + "Users/example/private",
+            "service" + "." + "internal",
+        )
+        for marker in markers:
+            with self.subTest(marker_kind=marker.rsplit(".", 1)[-1]), self.copied_repository() as repo:
+                notes = repo / "notes"
+                notes.mkdir()
+                (notes / "new.md").write_text(marker + "\n", encoding="utf-8")
+
+                self.assert_invalid(
+                    repo,
+                    "public content contains internal/local marker: notes/new.md",
+                )
+
+    def test_public_content_scan_covers_scanner_and_tests(self) -> None:
+        targets = (
+            "skills/create-public-pr/scripts/audit_public_pr.py",
+            "tests/test_audit_public_pr.py",
+        )
+        for relative_path in targets:
+            with self.subTest(relative_path=relative_path), self.copied_repository() as repo:
+                path = repo / relative_path
+                marker = "/" + "Users/example/private"
+                path.write_text(
+                    path.read_text(encoding="utf-8") + "\n# " + marker + "\n",
+                    encoding="utf-8",
+                )
+
+                self.assert_invalid(
+                    repo,
+                    f"public content contains internal/local marker: {relative_path}",
+                )
+
+    def test_eval_semantics_require_exact_routing_and_pressure_coverage(self) -> None:
+        with self.copied_repository() as repo:
+            evals_path = repo / "skills/create-public-pr/evals/evals.json"
+            payload = json.loads(evals_path.read_text(encoding="utf-8"))
+            replacements = {
+                "routing-positive": (("create", "make"), ("publish", "share")),
+                "routing-negative": (
+                    ("issue-only", "other"),
+                    ("deployment", "release"),
+                ),
+                "workflow-pressure": (
+                    ("one-to-one audit/review comparator", "manual review"),
+                ),
+            }
+            def replace_all(text: str, pairs: tuple[tuple[str, str], ...]) -> str:
+                for old, new in pairs:
+                    text = text.replace(old, new).replace(old.title(), new.title())
+                return text
+
+            for case in payload["evals"]:
+                pairs = replacements.get(case["kind"], ())
+                for field in ("prompt", "expected_output"):
+                    case[field] = replace_all(case[field], pairs)
+                case["expectations"] = [
+                    replace_all(expectation, pairs)
+                    for expectation in case["expectations"]
+                ]
+            evals_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = self.run_validator(repo)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("routing-positive eval trigger coverage is incomplete", result.stdout)
+            self.assertIn("routing-negative eval trigger coverage is incomplete", result.stdout)
+            self.assertIn("workflow-pressure eval expectations are incomplete", result.stdout)
+
+    def test_readme_uses_official_repository_and_badge(self) -> None:
+        with self.copied_repository() as repo:
+            readme_path = repo / "README.md"
+            content = readme_path.read_text(encoding="utf-8")
+            content = content.replace(
+                "takeshijuan/create-public-pr --skill create-public-pr",
+                "YOUR_GITHUB_OWNER/create-public-pr --skill create-public-pr",
+            )
+            content = content.replace(
+                "[![skills.sh](https://skills.sh/b/takeshijuan/create-public-pr)](https://skills.sh/takeshijuan/create-public-pr)",
+                "skills.sh",
+            )
+            readme_path.write_text(content, encoding="utf-8")
+
+            result = self.run_validator(repo)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("README installation must use the public repository", result.stdout)
+            self.assertIn("README official skills.sh badge is missing", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
