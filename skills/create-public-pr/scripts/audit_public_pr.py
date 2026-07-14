@@ -66,12 +66,17 @@ def path_id(path: str) -> str:
 
 
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            capture_output=True,
+        )
+    except UnicodeError as exc:
+        raise AuditError from exc
 
 
 def git_bytes(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -263,6 +268,32 @@ def added_lines(diff: bytes, prefix_width: int = 1) -> list[str]:
     return lines
 
 
+def merge_added_lines(
+    repo: Path, parents: list[str], commit: str, path: str
+) -> list[str]:
+    additions: set[str] | None = None
+    for parent in parents:
+        diff = git_bytes(
+            repo,
+            "diff",
+            "--text",
+            "--no-textconv",
+            "--no-ext-diff",
+            "--unified=0",
+            parent,
+            commit,
+            "--",
+            path,
+        ).stdout
+        parent_additions = set(added_lines(diff))
+        additions = (
+            parent_additions
+            if additions is None
+            else additions.intersection(parent_additions)
+        )
+    return sorted(additions or ())
+
+
 def is_github_noreply(address: str) -> bool:
     address = address.strip().lower()
     return address == "noreply@github.com" or address.endswith(
@@ -338,16 +369,7 @@ def scan_commits(
                     "-z",
                     commit,
                 ).stdout.split(b"\0")
-                diff = git_bytes(
-                    repo,
-                    "show",
-                    "--cc",
-                    "--format=",
-                    "--no-ext-diff",
-                    "--unified=0",
-                    commit,
-                ).stdout
-                prefix_width = len(parents)
+                content_lines: list[str] = []
             elif parents:
                 parent = parents[0]
                 changed_paths = git_bytes(
@@ -364,13 +386,15 @@ def scan_commits(
                 diff = git_bytes(
                     repo,
                     "diff",
+                    "--text",
+                    "--no-textconv",
                     "--no-ext-diff",
                     "--unified=0",
                     parent,
                     commit,
                     "--",
                 ).stdout
-                prefix_width = 1
+                content_lines = added_lines(diff)
             else:
                 changed_paths = git_bytes(
                     repo,
@@ -388,11 +412,13 @@ def scan_commits(
                     "show",
                     "--root",
                     "--format=",
+                    "--text",
+                    "--no-textconv",
                     "--no-ext-diff",
                     "--unified=0",
                     commit,
                 ).stdout
-                prefix_width = 1
+                content_lines = added_lines(diff)
             for raw_path in changed_paths:
                 if not raw_path:
                     continue
@@ -444,7 +470,19 @@ def scan_commits(
                             path=changed_path,
                         )
                     )
-            for line in added_lines(diff, prefix_width):
+                elif len(parents) > 1:
+                    for line in merge_added_lines(repo, parents, commit, changed_path):
+                        findings.extend(
+                            scan_text(
+                                line,
+                                profile=profile,
+                                source="committed-content",
+                                repo_identity=repo_identity,
+                                commit=commit,
+                                path=changed_path,
+                            )
+                        )
+            for line in content_lines:
                 findings.extend(
                     scan_text(
                         line,
@@ -614,11 +652,25 @@ def scan_worktree(
                 for source, diff_args in (
                     (
                         "staged-content",
-                        ("diff", "--cached", "--no-ext-diff", "--unified=0", "HEAD"),
+                        (
+                            "diff",
+                            "--cached",
+                            "--text",
+                            "--no-textconv",
+                            "--no-ext-diff",
+                            "--unified=0",
+                            "HEAD",
+                        ),
                     ),
                     (
                         "worktree-content",
-                        ("diff", "--no-ext-diff", "--unified=0"),
+                        (
+                            "diff",
+                            "--text",
+                            "--no-textconv",
+                            "--no-ext-diff",
+                            "--unified=0",
+                        ),
                     ),
                 ):
                     diff = git_bytes(repo, *diff_args, "--", path).stdout

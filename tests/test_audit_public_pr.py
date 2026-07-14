@@ -89,6 +89,36 @@ def audit(
     )
 
 
+def install_raw_commit(repo: Path, invalid_field: str) -> str:
+    parent = git(repo, "rev-parse", "HEAD").stdout.strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+    private_path = b"/" + b"Users/" + b"invalid-owner/private-repo"
+    invalid_value = b"Invalid \xff " + private_path
+    identity = invalid_value if invalid_field == "identity" else b"Public Contributor"
+    message = invalid_value if invalid_field == "message" else b"safe message"
+    email = b"12345+public@users.noreply.github.com"
+    raw_commit = b"\n".join(
+        (
+            b"tree " + tree.encode("ascii"),
+            b"parent " + parent.encode("ascii"),
+            b"author " + identity + b" <" + email + b"> 1700000000 +0000",
+            b"committer " + identity + b" <" + email + b"> 1700000000 +0000",
+            b"",
+            message,
+            b"",
+        )
+    )
+    result = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+        input=raw_commit,
+        capture_output=True,
+        check=True,
+    )
+    commit = result.stdout.decode("ascii").strip()
+    git(repo, "reset", "--hard", "--quiet", commit)
+    return parent
+
+
 def test_clean_committed_change_passes(tmp_path: Path) -> None:
     repo = initialize_repo(tmp_path)
     (repo / "public.txt").write_text(
@@ -172,6 +202,160 @@ def test_detects_sensitive_added_content(
     assert category in {finding["category"] for finding in payload["findings"]}
     assert content not in result.stdout
     assert content not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("state", "source"),
+    [
+        ("committed", "committed-content"),
+        ("staged", "staged-content"),
+        ("unstaged", "worktree-content"),
+    ],
+)
+def test_diff_attribute_cannot_hide_sensitive_text(
+    tmp_path: Path, state: str, source: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / ".gitattributes").write_text("secret.txt -diff\n", encoding="utf-8")
+    (repo / "secret.txt").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "secret.txt")
+    git(repo, "commit", "-m", "add text attributes")
+
+    credential = "api_" + "key = sk-" + "attribute-" + "A" * 24
+    (repo / "secret.txt").write_text(credential + "\n", encoding="utf-8")
+    if state == "committed":
+        git(repo, "add", "secret.txt")
+        git(repo, "commit", "-m", "update attributed text")
+        result = audit(repo)
+    elif state == "staged":
+        git(repo, "add", "secret.txt")
+        result = audit(repo, "HEAD")
+    else:
+        result = audit(repo, "HEAD")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert any(
+        finding["category"] == "credential" and finding["source"] == source
+        for finding in payload["findings"]
+    )
+    assert credential not in result.stdout
+    assert credential not in result.stderr
+
+
+def test_diff_attribute_cannot_hide_sensitive_text_in_root_commit(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Public Contributor")
+    git(repo, "config", "user.email", "12345+public@users.noreply.github.com")
+    git(repo, "config", "commit.gpgsign", "false")
+    credential = "api_" + "key = sk-" + "root-attribute-" + "A" * 24
+    (repo / ".gitattributes").write_text("secret.txt -diff\n", encoding="utf-8")
+    (repo / "secret.txt").write_text(credential + "\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "secret.txt")
+    git(repo, "commit", "-m", "root attributed text")
+
+    git(repo, "checkout", "--orphan", "unrelated")
+    git(repo, "rm", "-f", ".gitattributes", "secret.txt")
+    (repo / "unrelated.txt").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "unrelated.txt")
+    git(repo, "commit", "-m", "unrelated base")
+    git(repo, "checkout", "main")
+
+    result = audit(repo, "unrelated")
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "credential" and finding["source"] == "committed-content"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert credential not in result.stdout
+
+
+def test_diff_attribute_cannot_hide_sensitive_merge_resolution(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / ".gitattributes").write_text("secret.txt -diff\n", encoding="utf-8")
+    (repo / "secret.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "secret.txt")
+    git(repo, "commit", "-m", "add attributed merge file")
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    git(repo, "checkout", "-b", "side")
+    (repo / "secret.txt").write_text("side\n", encoding="utf-8")
+    git(repo, "add", "secret.txt")
+    git(repo, "commit", "-m", "change side")
+
+    git(repo, "checkout", "main")
+    (repo / "secret.txt").write_text("main\n", encoding="utf-8")
+    git(repo, "add", "secret.txt")
+    git(repo, "commit", "-m", "change main")
+    merge = subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-ff", "side"],
+        text=True,
+        capture_output=True,
+    )
+    assert merge.returncode == 1
+    credential = "api_" + "key = sk-" + "merge-attribute-" + "A" * 24
+    (repo / "secret.txt").write_text(credential + "\n", encoding="utf-8")
+    git(repo, "add", "secret.txt")
+    git(repo, "commit", "-m", "resolve attributed merge")
+
+    result = audit(repo, base)
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "credential" and finding["source"] == "committed-content"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert credential not in result.stdout
+
+
+@pytest.mark.parametrize("driver_option", ["command", "textconv"])
+def test_custom_diff_driver_cannot_hide_content_or_execute(
+    tmp_path: Path, driver_option: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    marker = tmp_path / f"{driver_option}-executed"
+    driver = tmp_path / f"{driver_option}-driver.py"
+    driver.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "print('masked diff')\n",
+        encoding="utf-8",
+    )
+    git(
+        repo,
+        "config",
+        f"diff.malicious.{driver_option}",
+        f"{sys.executable} {driver}",
+    )
+    (repo / ".gitattributes").write_text(
+        "secret.txt diff=malicious\n", encoding="utf-8"
+    )
+    (repo / "secret.txt").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "secret.txt")
+    git(repo, "commit", "-m", "add custom diff driver")
+
+    credential = "api_" + "key = sk-" + "driver-" + "A" * 24
+    (repo / "secret.txt").write_text(credential + "\n", encoding="utf-8")
+    git(repo, "add", "secret.txt")
+    git(repo, "commit", "-m", "update custom diff text")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "credential" and finding["source"] == "committed-content"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert not marker.exists()
+    assert credential not in result.stdout
+    assert credential not in result.stderr
 
 
 def test_scans_commit_messages(tmp_path: Path) -> None:
@@ -824,6 +1008,58 @@ def test_malformed_remote_returns_redacted_incomplete_output(
     assert result.stderr == ""
 
 
+@pytest.mark.parametrize(
+    ("invalid_field", "output_format"),
+    [
+        ("message", "json"),
+        ("message", "text"),
+        ("identity", "json"),
+        ("identity", "text"),
+    ],
+)
+def test_invalid_utf8_commit_metadata_fails_closed_and_redacted(
+    tmp_path: Path, invalid_field: str, output_format: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    base = install_raw_commit(repo, invalid_field)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--base",
+            base,
+            "--profile",
+            "community",
+            "--format",
+            output_format,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    if output_format == "json":
+        assert json.loads(result.stdout) == {
+            "complete": False,
+            "error": "repository validation failed",
+            "findings": [],
+            "profile": "community",
+        }
+    else:
+        assert "audit: incomplete" in result.stdout
+        assert "repository validation failed" in result.stdout
+    private_path = "/" + "Users/" + "invalid-owner/private-repo"
+    output = result.stdout + result.stderr
+    assert private_path not in output
+    assert "/" + "Users/" not in output
+    assert "\\xff" not in output
+    assert "\ufffd" not in output
+    assert result.stderr == ""
+
+
 @pytest.mark.parametrize("target", ["/tmp/index-target", "../index-target"])
 def test_flags_staged_symlink_target_after_worktree_becomes_regular_file(
     tmp_path: Path, target: str
@@ -1013,6 +1249,54 @@ def test_merge_does_not_reclassify_base_content_retained_from_one_parent(
     private_file.write_text(secret + "\nsafe retained note\n", encoding="utf-8")
     git(repo, "add", "private.txt")
     git(repo, "commit", "-m", "retain main version")
+
+    result = audit(repo, base)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["findings"] == []
+    assert secret not in result.stdout
+
+
+def test_merge_does_not_cross_match_retained_lines_between_paths(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    secret = "api_" + "key = sk-" + "retained-cross-path-" + "B" * 24
+    first = repo / "first.txt"
+    second = repo / "second.txt"
+    first.write_text(secret + "\n", encoding="utf-8")
+    second.write_text(secret + "\n", encoding="utf-8")
+    git(repo, "add", "first.txt", "second.txt")
+    git(repo, "commit", "-m", "add base content in two paths")
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    git(repo, "checkout", "-b", "delete-first")
+    first.write_text("safe first\n", encoding="utf-8")
+    git(repo, "add", "first.txt")
+    git(repo, "commit", "-m", "delete first base content")
+
+    git(repo, "checkout", "main")
+    second.write_text("safe second\n", encoding="utf-8")
+    git(repo, "add", "second.txt")
+    git(repo, "commit", "-m", "delete second base content")
+    merge = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            "delete-first",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert merge.returncode == 0
+    first.write_text(secret + "\n", encoding="utf-8")
+    second.write_text(secret + "\n", encoding="utf-8")
+    git(repo, "add", "first.txt", "second.txt")
+    git(repo, "commit", "-m", "retain both parent versions")
 
     result = audit(repo, base)
 
