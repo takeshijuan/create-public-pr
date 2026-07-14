@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""Audit a proposed public pull request for privacy-sensitive material."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import subprocess
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+
+
+class AuditError(Exception):
+    """Raised when the scanner cannot prove that its audit is complete."""
+
+
+Finding = dict[str, str]
+
+
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----")
+CREDENTIAL_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|access[_-]?key|client[_-]?secret|password|passwd|secret|token|authorization)\b"
+    r"\s*[:=]\s*['\"]?[^\s'\"<>]{8,}"
+)
+CREDENTIAL_TOKEN_RE = re.compile(
+    r"(?:\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{36,255}\b|"
+    r"\bgithub_pat_[A-Za-z0-9_]{20,255}\b|(?i:\bBearer\s+[A-Za-z0-9._~+/-]{20,}))"
+)
+CREDENTIAL_URL_RE = re.compile(r"(?i)https?://[^\s/:@]+:[^\s/@]+@[^\s/]+")
+COLLABORATION_URL_RE = re.compile(
+    r"(?i)https?://[^\s/]*(?:slack\.com|notion\.so|docs\.google\.com|"
+    r"drive\.google\.com|linear\.app|discord\.com|teams\.microsoft\.com|"
+    r"clickup\.com|atlassian\.net)(?:/[^\s]*)?"
+)
+LOCAL_HOST_RE = re.compile(r"(?i)\b(?:localhost|[a-z0-9.-]+\.(?:local|internal))\b")
+IP_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
+IPV6_RE = re.compile(r"\[([0-9A-Fa-f:]+)\]")
+LOCAL_PATH_RE = re.compile(
+    r"(?i)(?:file://)?(?:/Users/[^\s]+|/home/[^\s]+|[A-Z]:\\Users\\[^\s]+|~/[^\s]+)"
+)
+EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b")
+TRACKER_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-[1-9]\d*\b")
+REPOSITORY_URL_RE = re.compile(
+    r"(?i)(?:https?|ssh|git)://(?:[^\s/@]+@)?(?:www\.)?"
+    r"(github\.com|gitlab\.com|bitbucket\.org)/"
+    r"([A-Z0-9_.-]+)/([A-Z0-9_.-]+)"
+)
+REPOSITORY_SCP_RE = re.compile(
+    r"(?i)\bgit@(github\.com|gitlab\.com|bitbucket\.org):"
+    r"([A-Z0-9_.-]+)/([A-Z0-9_.-]+)"
+)
+
+
+def path_id(path: str) -> str:
+    return hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
+def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def git_bytes(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def validate_repository(repo_arg: str) -> Path:
+    repo = Path(repo_arg)
+    if not repo.is_dir():
+        raise AuditError
+    try:
+        inside = git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip()
+        top_level = Path(
+            git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+        ).resolve(strict=True)
+        repo = repo.resolve(strict=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AuditError from exc
+    if inside != "true" or repo != top_level:
+        raise AuditError
+    return repo
+
+
+def validate_base(repo: Path, base: str) -> str:
+    try:
+        git(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+        git(repo, "rev-parse", "--verify", "HEAD^{commit}")
+        branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AuditError from exc
+    if not branch:
+        raise AuditError
+    return branch
+
+
+def repository_identity(url: str) -> tuple[str, str, str] | None:
+    url = url.strip()
+    if not url:
+        return None
+    if "://" in url:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        parts = parsed.path.strip("/").split("/")
+    else:
+        match = re.match(r"(?:[^@]+@)?([^:]+):(.+)", url)
+        if not match:
+            return None
+        host = match.group(1).lower()
+        parts = match.group(2).strip("/").split("/")
+    if len(parts) < 2:
+        return None
+    owner, name = parts[0].lower(), parts[1].lower()
+    if name.endswith(".git"):
+        name = name[:-4]
+    return host, owner, name
+
+
+def current_repository_identity(repo: Path) -> tuple[str, str, str] | None:
+    try:
+        remotes = git(repo, "remote").stdout.splitlines()
+        if not remotes:
+            return None
+        remote = "origin" if "origin" in remotes else remotes[0]
+        return repository_identity(git(repo, "remote", "get-url", remote).stdout)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AuditError from exc
+
+
+def severity_for(category: str, profile: str) -> str:
+    if category in {"identity", "binary"}:
+        return "review"
+    if category == "repository-link" and profile == "community":
+        return "review"
+    return "blocking"
+
+
+def make_finding(
+    category: str,
+    profile: str,
+    source: str,
+    *,
+    commit: str | None = None,
+    path: str | None = None,
+) -> Finding:
+    finding = {
+        "category": category,
+        "severity": severity_for(category, profile),
+        "source": source,
+    }
+    if commit:
+        finding["commit"] = commit[:12]
+    if path:
+        finding["path_id"] = path_id(path)
+    return finding
+
+
+def scan_text(
+    text: str,
+    *,
+    profile: str,
+    source: str,
+    repo_identity: tuple[str, str, str] | None,
+    commit: str | None = None,
+    path: str | None = None,
+) -> list[Finding]:
+    categories: set[str] = set()
+    if PRIVATE_KEY_RE.search(text):
+        categories.add("private-key")
+    if CREDENTIAL_RE.search(text) or CREDENTIAL_TOKEN_RE.search(text):
+        categories.add("credential")
+    if CREDENTIAL_URL_RE.search(text):
+        categories.add("credential-url")
+    if COLLABORATION_URL_RE.search(text):
+        categories.add("collaboration-url")
+    if LOCAL_HOST_RE.search(text):
+        categories.add("private-host")
+    for match in IP_RE.finditer(text):
+        try:
+            address = ipaddress.ip_address(match.group(0))
+        except ValueError:
+            continue
+        if address.is_private or address.is_loopback or address.is_link_local:
+            categories.add("private-host")
+    for match in IPV6_RE.finditer(text):
+        try:
+            address = ipaddress.ip_address(match.group(1))
+        except ValueError:
+            continue
+        if address.is_private or address.is_loopback or address.is_link_local:
+            categories.add("private-host")
+    if LOCAL_PATH_RE.search(text):
+        categories.add("local-path")
+    for match in EMAIL_RE.finditer(text):
+        address = match.group(0).lower()
+        domain = match.group(1).lower()
+        if address in {
+            "git@github.com",
+            "git@gitlab.com",
+            "git@bitbucket.org",
+        }:
+            continue
+        if address.endswith("@users.noreply.github.com"):
+            continue
+        if domain in {"example.com", "example.net", "example.org"}:
+            continue
+        if domain.endswith((".example", ".invalid", ".test")):
+            continue
+        categories.add("email")
+    if TRACKER_RE.search(text):
+        categories.add("external-tracker")
+    for match in [
+        *REPOSITORY_URL_RE.finditer(text),
+        *REPOSITORY_SCP_RE.finditer(text),
+    ]:
+        linked = (
+            match.group(1).lower(),
+            match.group(2).lower(),
+            match.group(3).lower().removesuffix(".git"),
+        )
+        if linked != repo_identity:
+            categories.add("repository-link")
+    return [
+        make_finding(
+            category,
+            profile,
+            source,
+            commit=commit,
+            path=path,
+        )
+        for category in sorted(categories)
+    ]
+
+
+def added_lines(diff: bytes) -> list[str]:
+    lines: list[str] = []
+    for raw_line in diff.splitlines():
+        if raw_line.startswith(b"+") and not raw_line.startswith(b"+++"):
+            lines.append(raw_line[1:].decode("utf-8", "replace"))
+    return lines
+
+
+def is_github_noreply(address: str) -> bool:
+    address = address.strip().lower()
+    return address == "noreply@github.com" or address.endswith(
+        "@users.noreply.github.com"
+    )
+
+
+def unsafe_symlink_target(path: str, target: str) -> bool:
+    if PurePosixPath(target).is_absolute() or re.match(r"^[A-Za-z]:[\\/]", target):
+        return True
+    depth = 0
+    combined = PurePosixPath(path).parent / PurePosixPath(target)
+    for part in combined.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if depth == 0:
+                return True
+            depth -= 1
+        else:
+            depth += 1
+    return False
+
+
+def scan_commits(
+    repo: Path,
+    base: str,
+    profile: str,
+    repo_identity: tuple[str, str, str] | None,
+) -> list[Finding]:
+    try:
+        commits = git(
+            repo, "rev-list", "--reverse", f"{base}..HEAD"
+        ).stdout.splitlines()
+        findings: list[Finding] = []
+        for commit in commits:
+            changed_paths = git_bytes(
+                repo,
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--diff-filter=ACMRTUXB",
+                "-r",
+                "-z",
+                commit,
+            ).stdout.split(b"\0")
+            for raw_path in changed_paths:
+                if not raw_path:
+                    continue
+                changed_path = raw_path.decode("utf-8", "surrogateescape")
+                findings.extend(
+                    scan_text(
+                        changed_path,
+                        profile=profile,
+                        source="committed-path",
+                        repo_identity=repo_identity,
+                        commit=commit,
+                        path=changed_path,
+                    )
+                )
+                blob = git_bytes(repo, "show", f"{commit}:{changed_path}").stdout
+                tree_entry = git_bytes(
+                    repo, "ls-tree", "-z", commit, "--", changed_path
+                ).stdout
+                mode = tree_entry.split(b" ", 1)[0]
+                if mode == b"120000":
+                    target = blob.decode("utf-8", "replace")
+                    findings.extend(
+                        scan_text(
+                            target,
+                            profile=profile,
+                            source="committed-symlink-target",
+                            repo_identity=repo_identity,
+                            commit=commit,
+                            path=changed_path,
+                        )
+                    )
+                    if unsafe_symlink_target(changed_path, target):
+                        findings.append(
+                            make_finding(
+                                "symlink",
+                                profile,
+                                "committed-symlink",
+                                commit=commit,
+                                path=changed_path,
+                            )
+                        )
+                elif b"\0" in blob[:8192]:
+                    findings.append(
+                        make_finding(
+                            "binary",
+                            profile,
+                            "committed-binary",
+                            commit=commit,
+                            path=changed_path,
+                        )
+                    )
+            message = git(repo, "show", "-s", "--format=%B", commit).stdout
+            findings.extend(
+                scan_text(
+                    message,
+                    profile=profile,
+                    source="commit-message",
+                    repo_identity=repo_identity,
+                    commit=commit,
+                )
+            )
+            identities = (
+                git(
+                    repo,
+                    "show",
+                    "-s",
+                    "--format=%an%x00%ae%x00%cn%x00%ce",
+                    commit,
+                )
+                .stdout.rstrip("\n")
+                .split("\0")
+            )
+            if len(identities) != 4:
+                raise AuditError
+            author_name, author_email, committer_name, committer_email = identities
+            for kind, name, email in (
+                ("author", author_name, author_email),
+                ("committer", committer_name, committer_email),
+            ):
+                source = f"{kind}-identity"
+                findings.extend(
+                    scan_text(
+                        name,
+                        profile=profile,
+                        source=source,
+                        repo_identity=repo_identity,
+                        commit=commit,
+                    )
+                )
+                if not is_github_noreply(email):
+                    findings.append(
+                        make_finding(
+                            "identity",
+                            profile,
+                            source,
+                            commit=commit,
+                        )
+                    )
+            diff = git_bytes(
+                repo,
+                "show",
+                "--format=",
+                "--no-ext-diff",
+                "--unified=0",
+                commit,
+            ).stdout
+            for line in added_lines(diff):
+                findings.extend(
+                    scan_text(
+                        line,
+                        profile=profile,
+                        source="committed-content",
+                        repo_identity=repo_identity,
+                        commit=commit,
+                    )
+                )
+        return findings
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AuditError from exc
+
+
+def deduplicate(findings: list[Finding]) -> list[Finding]:
+    unique = {tuple(sorted(finding.items())): finding for finding in findings}
+    return [unique[key] for key in sorted(unique)]
+
+
+def selected_worktree_paths(
+    repo: Path, paths_from: str | None
+) -> list[tuple[str, bool]]:
+    try:
+        tracked = {
+            path.decode("utf-8", "surrogateescape")
+            for path in git_bytes(
+                repo, "diff", "--name-only", "-z", "HEAD", "--"
+            ).stdout.split(b"\0")
+            if path
+        }
+        untracked = {
+            path.decode("utf-8", "surrogateescape")
+            for path in git_bytes(
+                repo, "ls-files", "--others", "--exclude-standard", "-z"
+            ).stdout.split(b"\0")
+            if path
+        }
+        candidates = tracked | untracked
+        if paths_from is not None:
+            requested = {
+                PurePosixPath(line.strip()).as_posix()
+                for line in Path(paths_from).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+            for path in requested:
+                candidate = Path(path)
+                if candidate.is_absolute() or ".." in candidate.parts:
+                    raise AuditError
+            candidates = {
+                path
+                for path in candidates
+                if any(
+                    path == item or path.startswith(item.rstrip("/") + "/")
+                    for item in requested
+                )
+            }
+            for path in requested:
+                file_path = repo / path
+                if path in candidates or (
+                    not file_path.is_symlink() and not file_path.exists()
+                ):
+                    continue
+                tracked_result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "ls-files",
+                        "--error-unmatch",
+                        "--",
+                        path,
+                    ],
+                    capture_output=True,
+                )
+                if tracked_result.returncode != 0:
+                    candidates.add(path)
+                    untracked.add(path)
+        return [(path, path in untracked) for path in sorted(candidates)]
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+        raise AuditError from exc
+
+
+def scan_worktree(
+    repo: Path,
+    profile: str,
+    repo_identity: tuple[str, str, str] | None,
+    paths_from: str | None,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        for path, untracked in selected_worktree_paths(repo, paths_from):
+            findings.extend(
+                scan_text(
+                    path,
+                    profile=profile,
+                    source="worktree-path",
+                    repo_identity=repo_identity,
+                    path=path,
+                )
+            )
+            file_path = repo / path
+            if file_path.is_symlink():
+                target = os.readlink(file_path)
+                findings.extend(
+                    scan_text(
+                        target,
+                        profile=profile,
+                        source="worktree-symlink-target",
+                        repo_identity=repo_identity,
+                        path=path,
+                    )
+                )
+                if unsafe_symlink_target(path, target):
+                    findings.append(
+                        make_finding(
+                            "symlink",
+                            profile,
+                            "worktree-symlink",
+                            path=path,
+                        )
+                    )
+                continue
+            if not file_path.exists():
+                continue
+            current_content = file_path.read_bytes()
+            if b"\0" in current_content[:8192]:
+                findings.append(
+                    make_finding(
+                        "binary",
+                        profile,
+                        "worktree-binary",
+                        path=path,
+                    )
+                )
+                continue
+            if untracked:
+                content = current_content.decode("utf-8", "replace")
+                lines = content.splitlines()
+            else:
+                diff = git_bytes(
+                    repo,
+                    "diff",
+                    "--no-ext-diff",
+                    "--unified=0",
+                    "HEAD",
+                    "--",
+                    path,
+                ).stdout
+                lines = added_lines(diff)
+            for line in lines:
+                findings.extend(
+                    scan_text(
+                        line,
+                        profile=profile,
+                        source="worktree-content",
+                        repo_identity=repo_identity,
+                        path=path,
+                    )
+                )
+        return findings
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AuditError from exc
+
+
+def scan_proposals(
+    profile: str,
+    repo_identity: tuple[str, str, str] | None,
+    files: tuple[tuple[str, str | None], ...],
+) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        for source, filename in files:
+            if filename is None:
+                continue
+            text = Path(filename).read_text(encoding="utf-8")
+            findings.extend(
+                scan_text(
+                    text,
+                    profile=profile,
+                    source=source,
+                    repo_identity=repo_identity,
+                )
+            )
+        return findings
+    except (OSError, UnicodeError) as exc:
+        raise AuditError from exc
+
+
+def print_result(result: dict[str, object], output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(result, sort_keys=True))
+        return
+    if not result["complete"]:
+        print("audit: incomplete")
+        print(f"profile: {result['profile']}")
+        print(f"error: {result['error']}")
+        return
+    findings = result["findings"]
+    assert isinstance(findings, list)
+    print("audit: findings" if findings else "audit: clean")
+    print(f"profile: {result['profile']}")
+    for finding in findings:
+        assert isinstance(finding, dict)
+        details = [
+            str(finding["severity"]),
+            str(finding["category"]),
+            f"source={finding['source']}",
+        ]
+        if "commit" in finding:
+            details.append(f"commit={finding['commit']}")
+        if "path_id" in finding:
+            details.append(f"path_id={finding['path_id']}")
+        print("- " + " ".join(details))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--base", required=True)
+    parser.add_argument(
+        "--profile", choices=("community", "locked-down"), required=True
+    )
+    parser.add_argument("--paths-from")
+    parser.add_argument("--title-file")
+    parser.add_argument("--body-file")
+    parser.add_argument("--commit-message-file")
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        repo = validate_repository(args.repo)
+        branch = validate_base(repo, args.base)
+        repo_identity = current_repository_identity(repo)
+        findings = scan_text(
+            branch,
+            profile=args.profile,
+            source="branch-name",
+            repo_identity=repo_identity,
+        )
+        findings.extend(scan_commits(repo, args.base, args.profile, repo_identity))
+        findings.extend(
+            scan_worktree(repo, args.profile, repo_identity, args.paths_from)
+        )
+        findings.extend(
+            scan_proposals(
+                args.profile,
+                repo_identity,
+                (
+                    ("proposed-title", args.title_file),
+                    ("proposed-body", args.body_file),
+                    ("proposed-commit-message", args.commit_message_file),
+                ),
+            )
+        )
+        findings = deduplicate(findings)
+    except AuditError:
+        result = {
+            "complete": False,
+            "error": "repository validation failed",
+            "findings": [],
+            "profile": args.profile,
+        }
+        print_result(result, args.format)
+        return 2
+    result = {"complete": True, "findings": findings, "profile": args.profile}
+    print_result(result, args.format)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
