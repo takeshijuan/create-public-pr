@@ -23,12 +23,17 @@ class AuditReviewComparatorTests(unittest.TestCase):
     def run_comparator(
         self, audit: Any, reviews: Any
     ) -> subprocess.CompletedProcess[str]:
+        return self.run_comparator_text(json.dumps(audit), json.dumps(reviews))
+
+    def run_comparator_text(
+        self, audit_text: str, review_text: str = "[]"
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             audit_file = root / "audit.json"
             review_file = root / "review.json"
-            audit_file.write_text(json.dumps(audit), encoding="utf-8")
-            review_file.write_text(json.dumps(reviews), encoding="utf-8")
+            audit_file.write_text(audit_text, encoding="utf-8")
+            review_file.write_text(review_text, encoding="utf-8")
             return subprocess.run(
                 [
                     sys.executable,
@@ -85,6 +90,35 @@ class AuditReviewComparatorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "audit review validation: clean\n")
         self.assertEqual(result.stderr, "")
+
+    def test_deeply_nested_valid_json_is_generic_invalid_input(self) -> None:
+        marker = "deep-payload-marker"
+        nested_profile = "[" * 1200 + json.dumps(marker) + "]" * 1200
+        audit_text = (
+            '{"complete":true,"profile":'
+            + nested_profile
+            + ',"findings":[]}'
+        )
+
+        result = self.run_comparator_text(audit_text)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "audit review validation: invalid input\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn(marker, result.stdout + result.stderr)
+
+    def test_overlong_valid_json_integer_is_generic_invalid_input(self) -> None:
+        digits = "9" * 5000
+        audit_text = (
+            '{"complete":true,"profile":' + digits + ',"findings":[]}'
+        )
+
+        result = self.run_comparator_text(audit_text)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "audit review validation: invalid input\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn(digits[:100], result.stdout + result.stderr)
 
     def test_exact_eligible_review_record_passes(self) -> None:
         finding = {

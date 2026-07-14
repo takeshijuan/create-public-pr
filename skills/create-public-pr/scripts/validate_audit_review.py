@@ -88,16 +88,32 @@ COLLABORATION_HOST_RE = re.compile(
     r"clickup\.com|atlassian\.net)\b",
     re.I,
 )
+MAX_JSON_INTEGER_DIGITS = 4096
 
 
 class InputError(Exception):
     """Raised when comparator input cannot be parsed safely."""
 
 
+def parse_bounded_int(value: str) -> int:
+    if len(value.removeprefix("-")) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError
+    return int(value)
+
+
 def read_json(path_arg: str) -> Any:
     try:
-        return json.loads(Path(path_arg).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return json.loads(
+            Path(path_arg).read_text(encoding="utf-8"),
+            parse_int=parse_bounded_int,
+        )
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise InputError from exc
 
 
