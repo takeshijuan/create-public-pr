@@ -120,6 +120,43 @@ class AuditReviewComparatorTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertNotIn(digits[:100], result.stdout + result.stderr)
 
+    def test_json_nesting_above_portable_limit_is_generic_invalid_input(self) -> None:
+        marker = "nested-payload-marker"
+        nested_profile = "[" * 256 + json.dumps(marker) + "]" * 256
+        audit_text = (
+            '{"complete":true,"profile":'
+            + nested_profile
+            + ',"findings":[]}'
+        )
+
+        result = self.run_comparator_text(audit_text)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "audit review validation: invalid input\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn(marker, result.stdout + result.stderr)
+
+    def test_brackets_and_escaped_quotes_inside_string_do_not_count_as_nesting(
+        self,
+    ) -> None:
+        profile = (
+            "[" * 300
+            + "{" * 300
+            + ' public text with "escaped quotes" and \\\\ separators '
+            + "}" * 300
+            + "]" * 300
+        )
+        audit_text = json.dumps(
+            {"complete": True, "profile": profile, "findings": []}
+        )
+
+        result = self.run_comparator_text(audit_text)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("audit profile is invalid", result.stdout)
+        self.assertNotIn("invalid input", result.stdout)
+        self.assertEqual(result.stderr, "")
+
     def test_exact_eligible_review_record_passes(self) -> None:
         finding = {
             "category": "repository-link",

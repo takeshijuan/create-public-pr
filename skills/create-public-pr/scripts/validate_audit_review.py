@@ -89,6 +89,7 @@ COLLABORATION_HOST_RE = re.compile(
     re.I,
 )
 MAX_JSON_INTEGER_DIGITS = 4096
+MAX_JSON_NESTING_DEPTH = 256
 
 
 class InputError(Exception):
@@ -101,10 +102,37 @@ def parse_bounded_int(value: str) -> int:
     return int(value)
 
 
+def validate_json_nesting(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_JSON_NESTING_DEPTH:
+                raise ValueError
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError
+
+
 def read_json(path_arg: str) -> Any:
     try:
+        text = Path(path_arg).read_text(encoding="utf-8")
+        validate_json_nesting(text)
         return json.loads(
-            Path(path_arg).read_text(encoding="utf-8"),
+            text,
             parse_int=parse_bounded_int,
         )
     except (
