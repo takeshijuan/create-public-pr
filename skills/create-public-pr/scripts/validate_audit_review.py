@@ -13,6 +13,7 @@ from audit_public_pr import scan_text
 
 
 KEY_FIELDS = ("category", "severity", "source", "commit", "path_id")
+AUDIT_FIELDS = {"complete", "profile", "findings"}
 BASE_FINDING_FIELDS = {"category", "severity", "source"}
 BASE_RECORD_FIELDS = {
     "category",
@@ -29,6 +30,7 @@ CHECK_FIELDS = {
     "no_internal_context",
     "provenance_and_license",
 }
+PROFILES = {"community", "locked-down"}
 EXPECTED_CHECKS = {
     "repository-link": {
         "public_without_credentials": "pass",
@@ -70,6 +72,7 @@ UNSAFE_EVIDENCE_CATEGORIES = {
     "local-path",
     "email",
     "repository-link",
+    "external-tracker",
 }
 SOURCE_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
 URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*" + r"://\S+", re.I)
@@ -118,7 +121,9 @@ def valid_safe_source(value: Any) -> bool:
     )
 
 
-def expected_severity(category: str, profile: str) -> str | None:
+def expected_severity(category: Any, profile: Any) -> str | None:
+    if not isinstance(category, str) or not isinstance(profile, str):
+        return None
     if category not in KNOWN_CATEGORIES:
         return None
     if category in {"binary", "identity"}:
@@ -141,6 +146,8 @@ def validate_finding(finding: Any, profile: str) -> bool:
     if not isinstance(category, str):
         return False
     severity = finding.get("severity")
+    if not isinstance(severity, str):
+        return False
     required_severity = expected_severity(category, profile)
     if required_severity is None or severity != required_severity:
         return False
@@ -190,9 +197,11 @@ def safe_evidence_text(value: Any, maximum: int) -> bool:
         source="review-evidence",
         repo_identity=None,
     )
-    return not any(
-        finding["category"] in UNSAFE_EVIDENCE_CATEGORIES for finding in findings
-    )
+    for finding in findings:
+        category = finding.get("category")
+        if isinstance(category, str) and category in UNSAFE_EVIDENCE_CATEGORIES:
+            return False
+    return True
 
 
 def validate_record(record: Any) -> bool:
@@ -205,9 +214,10 @@ def validate_record(record: Any) -> bool:
     if set(record) != expected_fields:
         return False
     category = record.get("category")
-    if category not in EXPECTED_CHECKS:
+    if not isinstance(category, str) or category not in EXPECTED_CHECKS:
         return False
-    if record.get("severity") != "review":
+    severity = record.get("severity")
+    if not isinstance(severity, str) or severity != "review":
         return False
     if not valid_safe_source(record.get("source")):
         return False
@@ -218,9 +228,12 @@ def validate_record(record: Any) -> bool:
     checks = record.get("checks")
     if not isinstance(checks, dict) or set(checks) != CHECK_FIELDS:
         return False
+    if not all(isinstance(value, str) for value in checks.values()):
+        return False
     if checks != EXPECTED_CHECKS[category]:
         return False
-    if record.get("decision") != "approved":
+    decision = record.get("decision")
+    if not isinstance(decision, str) or decision != "approved":
         return False
     if not safe_evidence_text(record.get("reviewer"), maximum=120):
         return False
@@ -230,9 +243,15 @@ def validate_record(record: Any) -> bool:
 
 
 def validate(audit: Any, reviews: Any) -> list[str]:
-    if not isinstance(audit, dict) or audit.get("complete") is not True:
+    if not isinstance(audit, dict):
         return ["audit is incomplete"]
-    if audit.get("profile") not in {"community", "locked-down"}:
+    if set(audit) != AUDIT_FIELDS:
+        return ["audit schema is invalid"]
+    complete = audit.get("complete")
+    if not isinstance(complete, bool) or complete is not True:
+        return ["audit is incomplete"]
+    profile = audit.get("profile")
+    if not isinstance(profile, str) or profile not in PROFILES:
         return ["audit profile is invalid"]
     findings = audit.get("findings")
     if not isinstance(findings, list):
@@ -241,7 +260,6 @@ def validate(audit: Any, reviews: Any) -> list[str]:
         return ["review record schema is invalid"]
 
     errors: list[str] = []
-    profile = audit["profile"]
     valid_findings = [validate_finding(finding, profile) for finding in findings]
     if not all(valid_findings):
         errors.append("audit finding schema is invalid")

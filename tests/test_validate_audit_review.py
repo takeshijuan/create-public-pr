@@ -21,7 +21,7 @@ SCRIPT = (
 
 class AuditReviewComparatorTests(unittest.TestCase):
     def run_comparator(
-        self, audit: dict[str, Any], reviews: list[dict[str, Any]]
+        self, audit: Any, reviews: Any
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -63,6 +63,21 @@ class AuditReviewComparatorTests(unittest.TestCase):
 
     def audit_payload(self, findings: list[dict[str, Any]]) -> dict[str, Any]:
         return {"complete": True, "findings": findings, "profile": "community"}
+
+    def wrong_json_values(self) -> tuple[Any, ...]:
+        marker = "payload-marker"
+        return (None, [marker], {marker: "value"}, 17, True)
+
+    def assert_generic_schema_failure(
+        self,
+        result: subprocess.CompletedProcess[str],
+        expected_message: str,
+    ) -> None:
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(expected_message, result.stdout)
+        self.assertNotIn("payload-marker", result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_clean_audit_and_empty_reviews_pass(self) -> None:
         result = self.run_comparator(self.audit_payload([]), [])
@@ -396,6 +411,139 @@ class AuditReviewComparatorTests(unittest.TestCase):
         result = self.run_comparator(self.audit_payload([finding]), [record])
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_audit_profile_wrong_json_types_fail_generically(self) -> None:
+        for wrong_value in self.wrong_json_values():
+            with self.subTest(value_type=type(wrong_value).__name__):
+                audit = self.audit_payload([])
+                audit["profile"] = wrong_value
+
+                result = self.run_comparator(audit, [])
+
+                self.assert_generic_schema_failure(result, "audit profile is invalid")
+
+    def test_audit_complete_wrong_json_types_fail_generically(self) -> None:
+        marker = "payload-marker"
+        wrong_values = (None, [marker], {marker: "value"}, 17, False)
+        for wrong_value in wrong_values:
+            with self.subTest(value_type=type(wrong_value).__name__):
+                audit = self.audit_payload([])
+                audit["complete"] = wrong_value
+
+                result = self.run_comparator(audit, [])
+
+                self.assert_generic_schema_failure(result, "audit is incomplete")
+
+    def test_top_level_audit_rejects_extra_payload_fields(self) -> None:
+        audit = self.audit_payload([])
+        audit["payload-marker"] = "must-not-be-echoed"
+
+        result = self.run_comparator(audit, [])
+
+        self.assert_generic_schema_failure(result, "audit schema is invalid")
+
+    def test_finding_fields_reject_every_wrong_json_type_without_traceback(self) -> None:
+        valid_finding = {
+            "category": "credential",
+            "severity": "blocking",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+            "path_id": "abcdef012345",
+        }
+
+        for field in ("category", "severity", "source", "commit", "path_id"):
+            for wrong_value in self.wrong_json_values():
+                with self.subTest(field=field, value_type=type(wrong_value).__name__):
+                    finding = dict(valid_finding)
+                    finding[field] = wrong_value
+
+                    result = self.run_comparator(self.audit_payload([finding]), [])
+
+                    self.assert_generic_schema_failure(
+                        result, "audit finding schema is invalid"
+                    )
+
+    def test_record_fields_reject_every_wrong_json_type_without_traceback(self) -> None:
+        finding = {
+            "category": "repository-link",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+            "path_id": "abcdef012345",
+        }
+        valid_record = self.review_record(path_id="abcdef012345")
+
+        for field in (
+            "category",
+            "severity",
+            "source",
+            "commit",
+            "path_id",
+            "checks",
+            "decision",
+            "reviewer",
+            "rationale",
+        ):
+            for wrong_value in self.wrong_json_values():
+                with self.subTest(field=field, value_type=type(wrong_value).__name__):
+                    record = dict(valid_record)
+                    record[field] = wrong_value
+
+                    result = self.run_comparator(
+                        self.audit_payload([finding]), [record]
+                    )
+
+                    self.assert_generic_schema_failure(
+                        result, "review record schema is invalid"
+                    )
+
+    def test_top_level_findings_and_reviews_reject_wrong_json_types(self) -> None:
+        marker = "payload-marker"
+        wrong_containers = (None, {marker: "value"}, 17, True)
+        for wrong_value in wrong_containers:
+            with self.subTest(field="findings", value_type=type(wrong_value).__name__):
+                audit = self.audit_payload([])
+                audit["findings"] = wrong_value
+                result = self.run_comparator(audit, [])
+                self.assert_generic_schema_failure(result, "audit findings are invalid")
+
+            with self.subTest(field="reviews", value_type=type(wrong_value).__name__):
+                result = self.run_comparator(self.audit_payload([]), wrong_value)
+                self.assert_generic_schema_failure(
+                    result, "review record schema is invalid"
+                )
+
+        findings_list = self.audit_payload([])
+        findings_list["findings"] = [marker]
+        self.assert_generic_schema_failure(
+            self.run_comparator(findings_list, []),
+            "audit finding schema is invalid",
+        )
+        self.assert_generic_schema_failure(
+            self.run_comparator(self.audit_payload([]), [marker]),
+            "review record schema is invalid",
+        )
+
+    def test_external_tracker_evidence_is_rejected_without_echo(self) -> None:
+        tracker = "PUBLIC" + "-123"
+        finding = {
+            "category": "repository-link",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+
+        for field in ("reviewer", "rationale"):
+            with self.subTest(field=field):
+                record = self.review_record(**{field: tracker})
+                result = self.run_comparator(
+                    self.audit_payload([finding]), [record]
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("review record schema is invalid", result.stdout)
+                self.assertNotIn(tracker, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":
