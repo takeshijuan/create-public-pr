@@ -30,7 +30,7 @@ CREDENTIAL_TOKEN_RE = re.compile(
     r"(?:\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{36,255}\b|"
     r"\bgithub_pat_[A-Za-z0-9_]{20,255}\b|(?i:\bBearer\s+[A-Za-z0-9._~+/-]{20,}))"
 )
-CREDENTIAL_URL_RE = re.compile(r"(?i)https?://[^\s/:@]+:[^\s/@]+@[^\s/]+")
+CREDENTIAL_URL_RE = re.compile(r"(?i)[A-Z][A-Z0-9+.-]*://[^\s/:@]+:[^\s/@]+@[^\s/]+")
 COLLABORATION_URL_RE = re.compile(
     r"(?i)https?://[^\s/]*(?:slack\.com|notion\.so|docs\.google\.com|"
     r"drive\.google\.com|linear\.app|discord\.com|teams\.microsoft\.com|"
@@ -38,9 +38,14 @@ COLLABORATION_URL_RE = re.compile(
 )
 LOCAL_HOST_RE = re.compile(r"(?i)\b(?:localhost|[a-z0-9.-]+\.(?:local|internal))\b")
 IP_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
-IPV6_RE = re.compile(r"\[([0-9A-Fa-f:]+)\]")
+IPV6_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])(\[?(?:[0-9A-Fa-f]{0,4}:){2,7}"
+    r"[0-9A-Fa-f]{0,4}\]?)(?![0-9A-Fa-f:])"
+)
 LOCAL_PATH_RE = re.compile(
-    r"(?i)(?:file://)?(?:/Users/[^\s]+|/home/[^\s]+|[A-Z]:\\Users\\[^\s]+|~/[^\s]+)"
+    r"(?i)(?:file://)?(?<![A-Z0-9:])/(?:Users|home|tmp|private(?:/tmp)?|"
+    r"var(?:/tmp|/folders)?|opt|srv|mnt|Volumes)/[^\s]+|"
+    r"[A-Z]:\\Users\\[^\s]+|~/[^\s]+"
 )
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b")
 TRACKER_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-[1-9]\d*\b")
@@ -134,7 +139,7 @@ def current_repository_identity(repo: Path) -> tuple[str, str, str] | None:
             return None
         remote = "origin" if "origin" in remotes else remotes[0]
         return repository_identity(git(repo, "remote", "get-url", remote).stdout)
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, UnicodeError, subprocess.CalledProcessError) as exc:
         raise AuditError from exc
 
 
@@ -195,7 +200,7 @@ def scan_text(
             categories.add("private-host")
     for match in IPV6_RE.finditer(text):
         try:
-            address = ipaddress.ip_address(match.group(1))
+            address = ipaddress.ip_address(match.group(1).strip("[]"))
         except ValueError:
             continue
         if address.is_private or address.is_loopback or address.is_link_local:
@@ -245,8 +250,13 @@ def scan_text(
 
 def added_lines(diff: bytes) -> list[str]:
     lines: list[str] = []
+    in_hunk = False
     for raw_line in diff.splitlines():
-        if raw_line.startswith(b"+") and not raw_line.startswith(b"+++"):
+        if raw_line.startswith(b"diff --git "):
+            in_hunk = False
+        elif raw_line.startswith(b"@@"):
+            in_hunk = True
+        elif in_hunk and raw_line.startswith(b"+"):
             lines.append(raw_line[1:].decode("utf-8", "replace"))
     return lines
 
@@ -273,6 +283,32 @@ def unsafe_symlink_target(path: str, target: str) -> bool:
         else:
             depth += 1
     return False
+
+
+def symlink_path_component(repo: Path, path: str) -> tuple[str, str, bool] | None:
+    relative = PurePosixPath(path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise AuditError
+    current = repo
+    components: list[str] = []
+    for index, component in enumerate(relative.parts):
+        if component in {"", "."}:
+            continue
+        components.append(component)
+        current = current / component
+        try:
+            metadata = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as exc:
+            raise AuditError from exc
+        if metadata.st_mode & 0o170000 == 0o120000:
+            try:
+                target = os.readlink(current)
+            except OSError as exc:
+                raise AuditError from exc
+            return "/".join(components), target, index == len(relative.parts) - 1
+    return None
 
 
 def scan_commits(
@@ -427,11 +463,18 @@ def selected_worktree_paths(
     repo: Path, paths_from: str | None
 ) -> list[tuple[str, bool]]:
     try:
-        tracked = {
+        staged = {
             path.decode("utf-8", "surrogateescape")
             for path in git_bytes(
-                repo, "diff", "--name-only", "-z", "HEAD", "--"
+                repo, "diff", "--cached", "--name-only", "-z", "HEAD", "--"
             ).stdout.split(b"\0")
+            if path
+        }
+        unstaged = {
+            path.decode("utf-8", "surrogateescape")
+            for path in git_bytes(repo, "diff", "--name-only", "-z", "--").stdout.split(
+                b"\0"
+            )
             if path
         }
         untracked = {
@@ -441,7 +484,7 @@ def selected_worktree_paths(
             ).stdout.split(b"\0")
             if path
         }
-        candidates = tracked | untracked
+        candidates = staged | unstaged | untracked
         if paths_from is not None:
             requested = {
                 PurePosixPath(line.strip()).as_posix()
@@ -461,10 +504,7 @@ def selected_worktree_paths(
                 )
             }
             for path in requested:
-                file_path = repo / path
-                if path in candidates or (
-                    not file_path.is_symlink() and not file_path.exists()
-                ):
+                if path in candidates:
                     continue
                 tracked_result = subprocess.run(
                     [
@@ -478,9 +518,14 @@ def selected_worktree_paths(
                     ],
                     capture_output=True,
                 )
-                if tracked_result.returncode != 0:
-                    candidates.add(path)
-                    untracked.add(path)
+                if tracked_result.returncode == 0:
+                    continue
+                link_component = symlink_path_component(repo, path)
+                file_path = repo / path
+                if link_component is None and not file_path.exists():
+                    continue
+                candidates.add(path)
+                untracked.add(path)
         return [(path, path in untracked) for path in sorted(candidates)]
     except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
         raise AuditError from exc
@@ -505,8 +550,46 @@ def scan_worktree(
                 )
             )
             file_path = repo / path
-            if file_path.is_symlink():
-                target = os.readlink(file_path)
+            if not untracked:
+                for source, diff_args in (
+                    (
+                        "staged-content",
+                        ("diff", "--cached", "--no-ext-diff", "--unified=0", "HEAD"),
+                    ),
+                    (
+                        "worktree-content",
+                        ("diff", "--no-ext-diff", "--unified=0"),
+                    ),
+                ):
+                    diff = git_bytes(repo, *diff_args, "--", path).stdout
+                    if source == "staged-content" and diff:
+                        index_entry = git_bytes(
+                            repo, "ls-files", "--stage", "-z", "--", path
+                        ).stdout
+                        if index_entry and not index_entry.startswith(b"120000 "):
+                            index_blob = git_bytes(repo, "show", f":{path}").stdout
+                            if b"\0" in index_blob[:8192]:
+                                findings.append(
+                                    make_finding(
+                                        "binary",
+                                        profile,
+                                        "staged-binary",
+                                        path=path,
+                                    )
+                                )
+                    for line in added_lines(diff):
+                        findings.extend(
+                            scan_text(
+                                line,
+                                profile=profile,
+                                source=source,
+                                repo_identity=repo_identity,
+                                path=path,
+                            )
+                        )
+            link_component = symlink_path_component(repo, path)
+            if link_component is not None:
+                component_path, target, is_final = link_component
                 findings.extend(
                     scan_text(
                         target,
@@ -516,12 +599,16 @@ def scan_worktree(
                         path=path,
                     )
                 )
-                if unsafe_symlink_target(path, target):
+                if not is_final or unsafe_symlink_target(component_path, target):
                     findings.append(
                         make_finding(
                             "symlink",
                             profile,
-                            "worktree-symlink",
+                            (
+                                "worktree-symlink"
+                                if is_final
+                                else "worktree-symlink-ancestor"
+                            ),
                             path=path,
                         )
                     )
@@ -543,16 +630,7 @@ def scan_worktree(
                 content = current_content.decode("utf-8", "replace")
                 lines = content.splitlines()
             else:
-                diff = git_bytes(
-                    repo,
-                    "diff",
-                    "--no-ext-diff",
-                    "--unified=0",
-                    "HEAD",
-                    "--",
-                    path,
-                ).stdout
-                lines = added_lines(diff)
+                lines = []
             for line in lines:
                 findings.extend(
                     scan_text(

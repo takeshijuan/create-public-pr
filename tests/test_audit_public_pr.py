@@ -620,3 +620,178 @@ def test_detects_repository_links_across_hosts_and_protocols(
         finding["category"] == "repository-link"
         for finding in json.loads(result.stdout)["findings"]
     )
+
+
+def test_paths_file_scans_selected_staged_content_even_if_worktree_reverts_it(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    for name in ("selected.txt", "excluded.txt"):
+        (repo / name).write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "selected.txt", "excluded.txt")
+    git(repo, "commit", "-m", "add tracked files")
+
+    selected_secret = "api_" + "key = sk-" + "selected-" + "S" * 24
+    excluded_secret = "api_" + "key = sk-" + "excluded-" + "E" * 24
+    (repo / "selected.txt").write_text(selected_secret + "\n", encoding="utf-8")
+    (repo / "excluded.txt").write_text(excluded_secret + "\n", encoding="utf-8")
+    git(repo, "add", "selected.txt", "excluded.txt")
+    (repo / "selected.txt").write_text("safe\n", encoding="utf-8")
+    (repo / "excluded.txt").write_text("safe\n", encoding="utf-8")
+    paths_file = tmp_path / "paths.txt"
+    paths_file.write_text("selected.txt\n", encoding="utf-8")
+
+    result = audit(repo, "HEAD", "--paths-from", str(paths_file))
+
+    assert result.returncode == 1
+    staged_findings = [
+        finding
+        for finding in json.loads(result.stdout)["findings"]
+        if finding["source"] == "staged-content"
+    ]
+    assert len(staged_findings) == 1
+    assert staged_findings[0]["category"] == "credential"
+    assert selected_secret not in result.stdout
+    assert excluded_secret not in result.stdout
+
+
+def test_flags_staged_binary_even_if_worktree_reverts_it(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "asset.bin").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "add tracked asset")
+    (repo / "asset.bin").write_bytes(b"\x00\x01\x02staged-binary")
+    git(repo, "add", "asset.bin")
+    (repo / "asset.bin").write_text("safe\n", encoding="utf-8")
+
+    result = audit(repo, "HEAD")
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "binary" and finding["source"] == "staged-binary"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+
+
+def test_paths_file_does_not_rescan_clean_tracked_binary(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "asset.bin").write_bytes(b"\x00\x01\x02base-binary")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "add base asset")
+    paths_file = tmp_path / "paths.txt"
+    paths_file.write_text("asset.bin\n", encoding="utf-8")
+
+    result = audit(repo, "HEAD", "--paths-from", str(paths_file))
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize("prefix", ["++", "+++"])
+def test_scans_added_content_that_begins_with_diff_header_markers(
+    tmp_path: Path, prefix: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    secret = prefix + " api_" + "key = sk-" + "plus-line-" + "P" * 24
+    (repo / "change.txt").write_text(secret + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add plus-prefixed content")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "credential" and finding["source"] == "committed-content"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert secret not in result.stdout
+
+
+def test_paths_file_reports_symlink_ancestor_without_following_it(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = "api_" + "key = sk-" + "outside-" + "O" * 24
+    (outside / "private.txt").write_text(secret + "\n", encoding="utf-8")
+    (repo / "redirect").symlink_to(outside, target_is_directory=True)
+    paths_file = tmp_path / "paths.txt"
+    paths_file.write_text("redirect/private.txt\n", encoding="utf-8")
+
+    result = audit(repo, "HEAD", "--paths-from", str(paths_file))
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(
+        finding["category"] == "symlink"
+        and finding["source"] == "worktree-symlink-ancestor"
+        for finding in findings
+    )
+    assert not any(finding["category"] == "credential" for finding in findings)
+    assert secret not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("category", "content"),
+    [
+        (
+            "credential-url",
+            "postgresql://" + "dbuser:dbpass@database.example/app",
+        ),
+        ("private-host", "fd00::1"),
+        ("local-path", "/tmp/" + "workspace/private-data"),
+    ],
+)
+def test_detects_expanded_private_url_host_and_path_forms(
+    tmp_path: Path, category: str, content: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(content + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add private reference")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    assert category in {
+        finding["category"] for finding in json.loads(result.stdout)["findings"]
+    }
+    assert content not in result.stdout
+
+
+@pytest.mark.parametrize("output_format", ["json", "text"])
+def test_malformed_remote_returns_redacted_incomplete_output(
+    tmp_path: Path, output_format: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    malformed_remote = "https://" + "[broken/repository.git"
+    git(repo, "remote", "set-url", "origin", malformed_remote)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--base",
+            "HEAD",
+            "--profile",
+            "community",
+            "--format",
+            output_format,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    if output_format == "json":
+        payload = json.loads(result.stdout)
+        assert payload["complete"] is False
+        assert payload["findings"] == []
+    else:
+        assert "audit: incomplete" in result.stdout
+    assert malformed_remote not in result.stdout
+    assert malformed_remote not in result.stderr
+    assert result.stderr == ""
