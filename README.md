@@ -32,6 +32,15 @@ npx --yes skills@1.5.17 add . --list
 
 The scanner uses only the Python standard library at runtime and supports Python 3.10 and newer.
 
+## v0.1.0 beta limitations
+
+This release is a beta with deliberately conservative stop conditions.
+
+- The scanner is heuristic and cannot prove that every form of sensitive or proprietary context is absent. Review the proposed public surface and complete every required manual-review record.
+- The documented GitHub mutation paths are tested with a deterministic fake `gh`; repository tests do not create or refresh a live GitHub pull request.
+- Community-profile repository links, changed binaries, and non-noreply commit identities require explicit review evidence. Locked-down blocking findings cannot be waived.
+- The skill prepares or refreshes pull requests only. It does not merge, deploy, rewrite history, or force-push.
+
 ## Validate a checkout
 
 ```sh

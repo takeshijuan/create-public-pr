@@ -31,6 +31,7 @@ REQUIRED_FILES = (
     "skills/create-public-pr/scripts/audit_public_pr.py",
     "skills/create-public-pr/scripts/validate_audit_review.py",
     "tests/test_audit_public_pr.py",
+    "tests/test_gh_workflow.py",
     "tests/test_validate_audit_review.py",
     "tests/test_validate_skill.py",
 )
@@ -389,6 +390,14 @@ def validate_readme_and_ci(repo: Path, errors: list[str]) -> None:
     pinned = "npx --yes skills@1.5.17 add . --list"
     if pinned not in readme:
         errors.append("README must document the skills@1.5.17 CI pin")
+    beta_markers = (
+        "## v0.1.0 beta limitations",
+        "heuristic",
+        "fake `gh`",
+        "live github",
+    )
+    if not all(marker in readme.lower() for marker in beta_markers):
+        errors.append("README v0.1.0 beta limitations are incomplete")
 
     workflow = read_text(repo, WORKFLOW_PATH, errors)
     if pinned not in workflow:

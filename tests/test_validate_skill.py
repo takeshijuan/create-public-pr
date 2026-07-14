@@ -61,6 +61,14 @@ class SkillRepositoryValidationTests(unittest.TestCase):
 
             self.assert_invalid(repo, "missing required file: SECURITY.md")
 
+    def test_stubbed_gh_integration_test_is_required(self) -> None:
+        with self.copied_repository() as repo:
+            (repo / "tests/test_gh_workflow.py").unlink()
+
+            self.assert_invalid(
+                repo, "missing required file: tests/test_gh_workflow.py"
+            )
+
     def test_routing_evals_require_positive_and_negative_cases(self) -> None:
         with self.copied_repository() as repo:
             evals_path = repo / "skills/create-public-pr/evals/evals.json"
@@ -127,6 +135,19 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             )
 
             self.assert_invalid(repo, "README installation must use skills@latest")
+
+    def test_readme_documents_v010_beta_limitations(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "README.md",
+                "## v0.1.0 beta limitations",
+                "## Limitations",
+            )
+
+            self.assert_invalid(
+                repo, "README v0.1.0 beta limitations are incomplete"
+            )
 
     def test_ci_pins_repository_discovery(self) -> None:
         with self.copied_repository() as repo:
