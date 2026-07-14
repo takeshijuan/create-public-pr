@@ -324,65 +324,110 @@ def scan_commits(
         ).stdout.splitlines()
         findings: list[Finding] = []
         for commit in commits:
-            changed_paths = git_bytes(
-                repo,
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "--diff-filter=ACMRTUXB",
-                "-r",
-                "-z",
-                commit,
-            ).stdout.split(b"\0")
-            for raw_path in changed_paths:
-                if not raw_path:
-                    continue
-                changed_path = raw_path.decode("utf-8", "surrogateescape")
-                findings.extend(
-                    scan_text(
-                        changed_path,
-                        profile=profile,
-                        source="committed-path",
-                        repo_identity=repo_identity,
-                        commit=commit,
-                        path=changed_path,
-                    )
-                )
-                blob = git_bytes(repo, "show", f"{commit}:{changed_path}").stdout
-                tree_entry = git_bytes(
-                    repo, "ls-tree", "-z", commit, "--", changed_path
-                ).stdout
-                mode = tree_entry.split(b" ", 1)[0]
-                if mode == b"120000":
-                    target = blob.decode("utf-8", "replace")
+            parents = git(repo, "show", "-s", "--format=%P", commit).stdout.split()
+            comparisons: list[str | None] = parents or [None]
+            for parent in comparisons:
+                if parent is None:
+                    changed_paths = git_bytes(
+                        repo,
+                        "diff-tree",
+                        "--root",
+                        "--no-commit-id",
+                        "--name-only",
+                        "--diff-filter=ACMRTUXB",
+                        "-r",
+                        "-z",
+                        commit,
+                    ).stdout.split(b"\0")
+                    diff = git_bytes(
+                        repo,
+                        "show",
+                        "--root",
+                        "--format=",
+                        "--no-ext-diff",
+                        "--unified=0",
+                        commit,
+                    ).stdout
+                else:
+                    changed_paths = git_bytes(
+                        repo,
+                        "diff",
+                        "--name-only",
+                        "--diff-filter=ACMRTUXB",
+                        "-r",
+                        "-z",
+                        parent,
+                        commit,
+                        "--",
+                    ).stdout.split(b"\0")
+                    diff = git_bytes(
+                        repo,
+                        "diff",
+                        "--no-ext-diff",
+                        "--unified=0",
+                        parent,
+                        commit,
+                        "--",
+                    ).stdout
+                for raw_path in changed_paths:
+                    if not raw_path:
+                        continue
+                    changed_path = raw_path.decode("utf-8", "surrogateescape")
                     findings.extend(
                         scan_text(
-                            target,
+                            changed_path,
                             profile=profile,
-                            source="committed-symlink-target",
+                            source="committed-path",
                             repo_identity=repo_identity,
                             commit=commit,
                             path=changed_path,
                         )
                     )
-                    if unsafe_symlink_target(changed_path, target):
-                        findings.append(
-                            make_finding(
-                                "symlink",
-                                profile,
-                                "committed-symlink",
+                    blob = git_bytes(repo, "show", f"{commit}:{changed_path}").stdout
+                    tree_entry = git_bytes(
+                        repo, "ls-tree", "-z", commit, "--", changed_path
+                    ).stdout
+                    mode = tree_entry.split(b" ", 1)[0]
+                    if mode == b"120000":
+                        target = blob.decode("utf-8", "replace")
+                        findings.extend(
+                            scan_text(
+                                target,
+                                profile=profile,
+                                source="committed-symlink-target",
+                                repo_identity=repo_identity,
                                 commit=commit,
                                 path=changed_path,
                             )
                         )
-                elif b"\0" in blob[:8192]:
-                    findings.append(
-                        make_finding(
-                            "binary",
-                            profile,
-                            "committed-binary",
+                        if unsafe_symlink_target(changed_path, target):
+                            findings.append(
+                                make_finding(
+                                    "symlink",
+                                    profile,
+                                    "committed-symlink",
+                                    commit=commit,
+                                    path=changed_path,
+                                )
+                            )
+                    elif b"\0" in blob[:8192]:
+                        findings.append(
+                            make_finding(
+                                "binary",
+                                profile,
+                                "committed-binary",
+                                commit=commit,
+                                path=changed_path,
+                            )
+                        )
+                for line in added_lines(diff):
+                    findings.extend(
+                        scan_text(
+                            line,
+                            profile=profile,
+                            source="committed-content",
+                            repo_identity=repo_identity,
                             commit=commit,
-                            path=changed_path,
                         )
                     )
             message = git(repo, "show", "-s", "--format=%B", commit).stdout
@@ -432,24 +477,6 @@ def scan_commits(
                             commit=commit,
                         )
                     )
-            diff = git_bytes(
-                repo,
-                "show",
-                "--format=",
-                "--no-ext-diff",
-                "--unified=0",
-                commit,
-            ).stdout
-            for line in added_lines(diff):
-                findings.extend(
-                    scan_text(
-                        line,
-                        profile=profile,
-                        source="committed-content",
-                        repo_identity=repo_identity,
-                        commit=commit,
-                    )
-                )
         return findings
     except (OSError, subprocess.CalledProcessError) as exc:
         raise AuditError from exc

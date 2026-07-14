@@ -889,3 +889,70 @@ def test_does_not_treat_relative_prose_or_urls_as_local_paths(
 
     assert result.returncode == 0
     assert json.loads(result.stdout)["findings"] == []
+
+
+def test_flags_binary_introduced_only_by_merge_conflict_resolution(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    asset = repo / "asset.bin"
+    asset.write_text("base\n", encoding="utf-8")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "add merge base")
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    git(repo, "checkout", "-b", "feature")
+    asset.write_text("feature\n", encoding="utf-8")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "change asset on feature")
+
+    git(repo, "checkout", "main")
+    asset.write_text("main\n", encoding="utf-8")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "change asset on main")
+    merge = subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-ff", "feature"],
+        text=True,
+        capture_output=True,
+    )
+    assert merge.returncode == 1
+    asset.write_bytes(b"\x00\x01\x02merge-result")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "resolve merge with binary asset")
+
+    result = audit(repo, base)
+
+    assert result.returncode == 1
+    binary_findings = [
+        finding
+        for finding in json.loads(result.stdout)["findings"]
+        if finding["category"] == "binary" and finding["source"] == "committed-binary"
+    ]
+    assert len(binary_findings) == 1
+
+
+def test_flags_binary_from_root_commit_when_base_is_unrelated(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Public Contributor")
+    git(repo, "config", "user.email", "12345+public@users.noreply.github.com")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "asset.bin").write_bytes(b"\x00\x01\x02root-binary")
+    git(repo, "add", "asset.bin")
+    git(repo, "commit", "-m", "root binary")
+
+    git(repo, "checkout", "--orphan", "unrelated")
+    git(repo, "rm", "-f", "asset.bin")
+    (repo / "unrelated.txt").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "unrelated.txt")
+    git(repo, "commit", "-m", "unrelated base")
+    git(repo, "checkout", "main")
+
+    result = audit(repo, "unrelated")
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "binary" and finding["source"] == "committed-binary"
+        for finding in json.loads(result.stdout)["findings"]
+    )
