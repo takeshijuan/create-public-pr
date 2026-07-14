@@ -86,20 +86,18 @@ class AuditReviewComparatorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_blocking_finding_always_stops_without_echoing_payload(self) -> None:
-        marker = "sensitive" + "-payload"
         finding = {
             "category": "credential",
             "severity": "blocking",
             "source": "committed-content",
             "commit": "0123456789ab",
-            "matched_value": marker,
         }
 
         result = self.run_comparator(self.audit_payload([finding]), [])
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("blocking findings are unresolved", result.stdout)
-        self.assertNotIn(marker, result.stdout + result.stderr)
+        self.assertNotIn("credential", result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_key_collision_cannot_hide_a_missing_record(self) -> None:
@@ -241,6 +239,163 @@ class AuditReviewComparatorTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("audit contains an ineligible review finding", result.stdout)
+
+    def test_every_finding_must_match_the_exact_safe_schema(self) -> None:
+        cases = (
+            {
+                "category": "credential",
+                "severity": "blocking",
+                "source": "committed-content",
+                "commit": "0123456789ab",
+                "unexpected": "sensitive-payload",
+            },
+            {
+                "category": "credential",
+                "severity": "blocking",
+                "source": "committed content",
+                "commit": "0123456789ab",
+            },
+            {
+                "category": "credential",
+                "severity": "blocking",
+                "source": "committed-content",
+                "path_id": "NOT-" + "HEX-" + "1234",
+            },
+            {
+                "category": ["credential"],
+                "severity": "blocking",
+                "source": "committed-content",
+            },
+        )
+
+        for finding in cases:
+            with self.subTest(finding=finding):
+                result = self.run_comparator(self.audit_payload([finding]), [])
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("audit finding schema is invalid", result.stdout)
+                self.assertNotIn("sensitive-payload", result.stdout + result.stderr)
+
+    def test_category_profile_and_severity_must_be_possible(self) -> None:
+        cases = (
+            ("community", "repository-link", "blocking"),
+            ("locked-down", "repository-link", "review"),
+            ("community", "binary", "blocking"),
+            ("community", "credential", "review"),
+            ("community", "unknown-category", "blocking"),
+            ("community", "unknown-category", None),
+            ("community", "credential", "warning"),
+        )
+
+        for profile, category, severity in cases:
+            with self.subTest(profile=profile, category=category, severity=severity):
+                finding = {
+                    "category": category,
+                    "severity": severity,
+                    "source": "committed-content",
+                    "commit": "0123456789ab",
+                }
+                audit = self.audit_payload([finding])
+                audit["profile"] = profile
+
+                result = self.run_comparator(audit, [])
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("audit finding schema is invalid", result.stdout)
+
+    def test_valid_locked_down_repository_link_is_blocking(self) -> None:
+        finding = {
+            "category": "repository-link",
+            "severity": "blocking",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+        audit = self.audit_payload([finding])
+        audit["profile"] = "locked-down"
+
+        result = self.run_comparator(audit, [])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("blocking findings are unresolved", result.stdout)
+        self.assertNotIn("audit finding schema is invalid", result.stdout)
+
+    def test_duplicate_audit_findings_are_rejected(self) -> None:
+        finding = {
+            "category": "credential",
+            "severity": "blocking",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+
+        result = self.run_comparator(
+            self.audit_payload([finding, dict(finding)]), []
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("duplicate audit findings are forbidden", result.stdout)
+
+    def test_manual_review_evidence_rejects_sensitive_text_without_echo(self) -> None:
+        unsafe_values = (
+            ("rationale", "https://" + "github.com/acme/private-repository"),
+            ("rationale", "git" + "@github.com:acme/private-repository.git"),
+            ("rationale", "github.com/" + "acme/private-repository"),
+            ("reviewer", "reviewer" + "@private-company.dev"),
+            ("reviewer", "@" + "maintainer"),
+            ("rationale", "/" + "Users/private-user/work/repository"),
+            ("rationale", "/" + "tmp"),
+            ("rationale", "api_" + "key=" + "live-secret-value"),
+            ("rationale", "https://" + "workspace.slack.com/archives/C123"),
+            ("rationale", "workspace." + "slack.com was checked"),
+            ("rationale", "service" + ".internal was checked"),
+        )
+        finding = {
+            "category": "repository-link",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+
+        for field, unsafe in unsafe_values:
+            with self.subTest(field=field, unsafe=unsafe):
+                record = self.review_record(**{field: unsafe})
+
+                result = self.run_comparator(
+                    self.audit_payload([finding]), [record]
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("review record schema is invalid", result.stdout)
+                self.assertNotIn(unsafe, result.stdout + result.stderr)
+
+    def test_manual_review_evidence_rejects_control_characters(self) -> None:
+        finding = {
+            "category": "repository-link",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+        record = self.review_record(rationale="Public reference.\nSecond line.")
+
+        result = self.run_comparator(self.audit_payload([finding]), [record])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("review record schema is invalid", result.stdout)
+
+    def test_manual_review_evidence_accepts_safe_prose(self) -> None:
+        finding = {
+            "category": "repository-link",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+        record = self.review_record(
+            reviewer="Release maintainer",
+            rationale="Public project reference verified as relevant to this change.",
+        )
+
+        result = self.run_comparator(self.audit_payload([finding]), [record])
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

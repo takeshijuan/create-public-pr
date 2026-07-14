@@ -461,21 +461,27 @@ def validate_public_content(repo: Path, errors: list[str]) -> None:
             if filename in excluded_files:
                 continue
             public_files.append(root_path / filename)
+
+    allowed_scanner_detector_lines = {
+        '    r"\\bgithub_pat_[A-Za-z0-9_]{20,255}\\b|(?i:\\bBea'
+        + 'rer\\s+[A-Za-z0-9._~+/-]{20,}))"',
+        'LOCAL_HOST_RE = re.compile(r"(?i)\\b(?:local'
+        + 'host|[a-z0-9.-]+\\.(?:local|internal))\\b")',
+        '    r"(?i)(?:file:'
+        + chr(47) * 3
+        + '(?:[^\\s'
+        + chr(47)
+        + ']+'
+        + chr(47)
+        + ')+[^\\s'
+        + chr(47)
+        + ']+|"',
+    }
+
     def intentional_detector_line(relative_path: str, line: str) -> bool:
-        stripped = line.strip()
         return (
             relative_path == "skills/create-public-pr/scripts/audit_public_pr.py"
-            and (
-                stripped.startswith('r"(?i)(?:file:///')
-                or "(?i:\\bBearer" in stripped
-                or stripped.startswith("LOCAL_HOST_RE = re.compile")
-            )
-        ) or (
-            relative_path == "scripts/validate_skill.py"
-            and stripped.startswith('r"file:///')
-        ) or (
-            relative_path == "tests/test_audit_public_pr.py"
-            and ('"http://" + "local' + "host") in stripped
+            and line in allowed_scanner_detector_lines
         )
 
     for path in sorted(public_files):

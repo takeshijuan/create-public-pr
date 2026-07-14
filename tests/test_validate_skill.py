@@ -263,6 +263,46 @@ class SkillRepositoryValidationTests(unittest.TestCase):
                     f"public content contains internal/local marker: {relative_path}",
                 )
 
+    def test_detector_allowances_require_exact_unmodified_scanner_lines(self) -> None:
+        allowed_lines = (
+            '    r"\\bgithub_pat_[A-Za-z0-9_]{20,255}\\b|(?i:\\bBea'
+            + 'rer\\s+[A-Za-z0-9._~+/-]{20,}))"',
+            'LOCAL_HOST_RE = re.compile(r"(?i)\\b(?:local'
+            + 'host|[a-z0-9.-]+\\.(?:local|internal))\\b")',
+            '    r"(?i)(?:file:'
+            + chr(47) * 3
+            + '(?:[^\\s'
+            + chr(47)
+            + ']+'
+            + chr(47)
+            + ')+[^\\s'
+            + chr(47)
+            + ']+|"',
+        )
+        marker = "service" + ".internal"
+
+        for allowed_line in allowed_lines:
+            with self.subTest(allowed_line=allowed_line), self.copied_repository() as repo:
+                scanner_path = (
+                    repo
+                    / "skills"
+                    / "create-public-pr"
+                    / "scripts"
+                    / "audit_public_pr.py"
+                )
+                content = scanner_path.read_text(encoding="utf-8")
+                self.assertEqual(content.count(allowed_line), 1)
+                scanner_path.write_text(
+                    content.replace(allowed_line, allowed_line + " # " + marker),
+                    encoding="utf-8",
+                )
+
+                self.assert_invalid(
+                    repo,
+                    "public content contains internal/local marker: "
+                    "skills/create-public-pr/scripts/audit_public_pr.py",
+                )
+
     def test_eval_semantics_require_exact_routing_and_pressure_coverage(self) -> None:
         with self.copied_repository() as repo:
             evals_path = repo / "skills/create-public-pr/evals/evals.json"

@@ -148,7 +148,7 @@ def test_detached_head_exits_incomplete(tmp_path: Path) -> None:
         ("private-key", "-----BEGIN " + "PRIVATE KEY-----"),
         ("credential-url", "https://" + "alice:passphrase@service.example/path"),
         ("collaboration-url", "https://" + "workspace.slack.com/archives/C0123"),
-        ("private-host", "http://" + "localhost:3000/internal"),
+        ("private-host", "http://" + "local" + "host:3000/internal"),
         ("private-host", "http://" + "10.0.0.8/internal"),
         ("private-host", "http://" + "[fd00::1]/internal"),
         ("local-path", "/Users/" + "private-user/work/project"),
