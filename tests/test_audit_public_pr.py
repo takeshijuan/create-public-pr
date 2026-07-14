@@ -956,3 +956,39 @@ def test_flags_binary_from_root_commit_when_base_is_unrelated(tmp_path: Path) ->
         finding["category"] == "binary" and finding["source"] == "committed-binary"
         for finding in json.loads(result.stdout)["findings"]
     )
+
+
+def test_merge_does_not_reclassify_base_content_retained_from_one_parent(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    secret = "api_" + "key = sk-" + "base-only-" + "B" * 24
+    private_file = repo / "private.txt"
+    private_file.write_text(secret + "\n", encoding="utf-8")
+    git(repo, "add", "private.txt")
+    git(repo, "commit", "-m", "add base content")
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    git(repo, "checkout", "-b", "delete-side")
+    git(repo, "rm", "private.txt")
+    git(repo, "commit", "-m", "delete private file")
+
+    git(repo, "checkout", "main")
+    private_file.write_text(secret + "\nsafe retained note\n", encoding="utf-8")
+    git(repo, "add", "private.txt")
+    git(repo, "commit", "-m", "add safe retained note")
+    merge = subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-ff", "delete-side"],
+        text=True,
+        capture_output=True,
+    )
+    assert merge.returncode == 1
+    private_file.write_text(secret + "\nsafe retained note\n", encoding="utf-8")
+    git(repo, "add", "private.txt")
+    git(repo, "commit", "-m", "retain main version")
+
+    result = audit(repo, base)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["findings"] == []
+    assert secret not in result.stdout
