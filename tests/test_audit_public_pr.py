@@ -795,3 +795,97 @@ def test_malformed_remote_returns_redacted_incomplete_output(
     assert malformed_remote not in result.stdout
     assert malformed_remote not in result.stderr
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("target", ["/tmp/index-target", "../index-target"])
+def test_flags_staged_symlink_target_after_worktree_becomes_regular_file(
+    tmp_path: Path, target: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    path = repo / "link"
+    path.write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "link")
+    git(repo, "commit", "-m", "add regular file")
+    path.unlink()
+    path.symlink_to(target)
+    git(repo, "add", "link")
+    path.unlink()
+    path.write_text("safe\n", encoding="utf-8")
+
+    result = audit(repo, "HEAD")
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "symlink" and finding["source"] == "staged-symlink"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert target not in result.stdout
+    assert target not in result.stderr
+
+
+def test_paths_file_dot_selects_changed_paths_from_repo_root(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "tracked.txt").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "add tracked file")
+    secret = "api_" + "key = sk-" + "root-selection-" + "D" * 24
+    (repo / "tracked.txt").write_text(secret + "\n", encoding="utf-8")
+    paths_file = tmp_path / "paths.txt"
+    paths_file.write_text(".\n", encoding="utf-8")
+
+    result = audit(repo, "HEAD", "--paths-from", str(paths_file))
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "credential" and finding["source"] == "worktree-content"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert secret not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "/etc/" + "ssh/config",
+        "D:\\workspace\\" + "private-data",
+        "\\\\fileserver\\share\\" + "private-data",
+    ],
+)
+def test_detects_general_unix_and_windows_absolute_paths(
+    tmp_path: Path, local_path: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(local_path + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add local reference")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "local-path"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert local_path not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "ordinary_text",
+    [
+        "docs/guides/setup.md",
+        "https://" + "example.com/etc/ssh/config",
+        "ordinary slash/containing prose",
+    ],
+)
+def test_does_not_treat_relative_prose_or_urls_as_local_paths(
+    tmp_path: Path, ordinary_text: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(ordinary_text + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add public reference")
+
+    result = audit(repo)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["findings"] == []

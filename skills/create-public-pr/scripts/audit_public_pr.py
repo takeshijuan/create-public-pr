@@ -43,9 +43,10 @@ IPV6_RE = re.compile(
     r"[0-9A-Fa-f]{0,4}\]?)(?![0-9A-Fa-f:])"
 )
 LOCAL_PATH_RE = re.compile(
-    r"(?i)(?:file://)?(?<![A-Z0-9:])/(?:Users|home|tmp|private(?:/tmp)?|"
-    r"var(?:/tmp|/folders)?|opt|srv|mnt|Volumes)/[^\s]+|"
-    r"[A-Z]:\\Users\\[^\s]+|~/[^\s]+"
+    r"(?i)(?:file:///(?:[^\s/]+/)+[^\s/]+|"
+    r"(?<![A-Z0-9:/\\])/(?!/)(?:[^\s/]+/)+[^\s/]+|"
+    r"(?<![A-Z0-9])[A-Z]:[\\/](?:[^\s\\/]+[\\/])*[^\s\\/]+|"
+    r"(?<!\\)\\\\[^\s\\]+\\[^\s\\]+(?:\\[^\s\\]+)+|~/[^\s]+)"
 )
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b")
 TRACKER_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-[1-9]\d*\b")
@@ -487,7 +488,11 @@ def selected_worktree_paths(
         candidates = staged | unstaged | untracked
         if paths_from is not None:
             requested = {
-                PurePosixPath(line.strip()).as_posix()
+                (
+                    ""
+                    if PurePosixPath(line.strip()).as_posix() == "."
+                    else PurePosixPath(line.strip()).as_posix()
+                )
                 for line in Path(paths_from).read_text(encoding="utf-8").splitlines()
                 if line.strip()
             }
@@ -499,11 +504,15 @@ def selected_worktree_paths(
                 path
                 for path in candidates
                 if any(
-                    path == item or path.startswith(item.rstrip("/") + "/")
+                    item == ""
+                    or path == item
+                    or path.startswith(item.rstrip("/") + "/")
                     for item in requested
                 )
             }
             for path in requested:
+                if path == "":
+                    continue
                 if path in candidates:
                     continue
                 tracked_result = subprocess.run(
@@ -566,7 +575,29 @@ def scan_worktree(
                         index_entry = git_bytes(
                             repo, "ls-files", "--stage", "-z", "--", path
                         ).stdout
-                        if index_entry and not index_entry.startswith(b"120000 "):
+                        if index_entry.startswith(b"120000 "):
+                            index_target = git_bytes(
+                                repo, "show", f":{path}"
+                            ).stdout.decode("utf-8", "replace")
+                            findings.extend(
+                                scan_text(
+                                    index_target,
+                                    profile=profile,
+                                    source="staged-symlink-target",
+                                    repo_identity=repo_identity,
+                                    path=path,
+                                )
+                            )
+                            if unsafe_symlink_target(path, index_target):
+                                findings.append(
+                                    make_finding(
+                                        "symlink",
+                                        profile,
+                                        "staged-symlink",
+                                        path=path,
+                                    )
+                                )
+                        elif index_entry:
                             index_blob = git_bytes(repo, "show", f":{path}").stdout
                             if b"\0" in index_blob[:8192]:
                                 findings.append(
