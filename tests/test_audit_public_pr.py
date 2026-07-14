@@ -1110,6 +1110,7 @@ def test_paths_file_dot_selects_changed_paths_from_repo_root(tmp_path: Path) -> 
     "local_path",
     [
         "/etc/" + "ssh/config",
+        "~/" + "Library/private-data",
         "D:\\workspace\\" + "private-data",
         "\\\\fileserver\\share\\" + "private-data",
     ],
@@ -1147,6 +1148,27 @@ def test_does_not_treat_relative_prose_or_urls_as_local_paths(
     (repo / "change.txt").write_text(ordinary_text + "\n", encoding="utf-8")
     git(repo, "add", "change.txt")
     git(repo, "commit", "-m", "add public reference")
+
+    result = audit(repo)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_does_not_treat_unity_tilde_directory_as_local_path(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    source = repo / "Packages" / "com.example.project" / "Tests~" / "Runtime"
+    source.mkdir(parents=True)
+    (source / "PublicTests.cs").write_text("public test fixture\n", encoding="utf-8")
+    git(
+        repo,
+        "add",
+        "-f",
+        "Packages/com.example.project/Tests~/Runtime/PublicTests.cs",
+    )
+    git(repo, "commit", "-m", "test: add Unity package fixture")
 
     result = audit(repo)
 
