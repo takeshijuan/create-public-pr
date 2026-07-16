@@ -12,7 +12,14 @@ from typing import Any
 from audit_public_pr import scan_text
 
 
-KEY_FIELDS = ("category", "severity", "source", "commit", "path_id")
+KEY_FIELDS = (
+    "category",
+    "severity",
+    "source",
+    "commit",
+    "path_id",
+    "artifact_id",
+)
 AUDIT_FIELDS = {"complete", "profile", "findings"}
 BASE_FINDING_FIELDS = {"category", "severity", "source"}
 BASE_RECORD_FIELDS = {
@@ -23,12 +30,6 @@ BASE_RECORD_FIELDS = {
     "decision",
     "reviewer",
     "rationale",
-}
-CHECK_FIELDS = {
-    "public_without_credentials",
-    "relevant_to_change",
-    "no_internal_context",
-    "provenance_and_license",
 }
 PROFILES = {"community", "locked-down"}
 EXPECTED_CHECKS = {
@@ -49,6 +50,13 @@ EXPECTED_CHECKS = {
         "relevant_to_change": "not-applicable",
         "no_internal_context": "pass",
         "provenance_and_license": "not-applicable",
+    },
+    "public-artifact": {
+        "public_without_credentials": "pass",
+        "relevant_to_change": "pass",
+        "no_internal_context": "pass",
+        "provenance_and_license": "pass",
+        "upstream_bytes_match": "pass",
     },
 }
 HARD_BLOCK_CATEGORIES = {
@@ -157,6 +165,10 @@ def valid_safe_identifier(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{12}", value))
 
 
+def valid_artifact_identifier(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
 def valid_safe_source(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -170,7 +182,7 @@ def expected_severity(category: Any, profile: Any) -> str | None:
         return None
     if category not in KNOWN_CATEGORIES:
         return None
-    if category in {"binary", "identity"}:
+    if category in {"binary", "identity", "public-artifact"}:
         return "review"
     if category == "repository-link" and profile == "community":
         return "review"
@@ -181,7 +193,7 @@ def validate_finding(finding: Any, profile: str) -> bool:
     if not isinstance(finding, dict):
         return False
     expected_fields = set(BASE_FINDING_FIELDS)
-    for optional in ("commit", "path_id"):
+    for optional in ("commit", "path_id", "artifact_id"):
         if optional in finding:
             expected_fields.add(optional)
     if set(finding) != expected_fields:
@@ -200,6 +212,15 @@ def validate_finding(finding: Any, profile: str) -> bool:
     if "commit" in finding and not valid_safe_identifier(finding["commit"]):
         return False
     if "path_id" in finding and not valid_safe_identifier(finding["path_id"]):
+        return False
+    if "artifact_id" in finding and not valid_artifact_identifier(
+        finding["artifact_id"]
+    ):
+        return False
+    if category == "public-artifact":
+        if "path_id" not in finding or "artifact_id" not in finding:
+            return False
+    elif "artifact_id" in finding:
         return False
     return True
 
@@ -252,7 +273,7 @@ def validate_record(record: Any) -> bool:
     if not isinstance(record, dict):
         return False
     expected_fields = set(BASE_RECORD_FIELDS)
-    for optional in ("commit", "path_id"):
+    for optional in ("commit", "path_id", "artifact_id"):
         if optional in record:
             expected_fields.add(optional)
     if set(record) != expected_fields:
@@ -269,8 +290,17 @@ def validate_record(record: Any) -> bool:
         return False
     if "path_id" in record and not valid_safe_identifier(record["path_id"]):
         return False
+    if "artifact_id" in record and not valid_artifact_identifier(
+        record["artifact_id"]
+    ):
+        return False
+    if category == "public-artifact":
+        if "path_id" not in record or "artifact_id" not in record:
+            return False
+    elif "artifact_id" in record:
+        return False
     checks = record.get("checks")
-    if not isinstance(checks, dict) or set(checks) != CHECK_FIELDS:
+    if not isinstance(checks, dict) or set(checks) != set(EXPECTED_CHECKS[category]):
         return False
     if not all(isinstance(value, str) for value in checks.values()):
         return False

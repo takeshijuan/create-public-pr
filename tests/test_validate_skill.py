@@ -149,6 +149,19 @@ class SkillRepositoryValidationTests(unittest.TestCase):
                 repo, "README v0.1.0 beta limitations are incomplete"
             )
 
+    def test_profile_routing_distinguishes_ordinary_oss_from_no_link_policy(
+        self,
+    ) -> None:
+        with self.copied_repository() as repo:
+            skill = (
+                repo / "skills/create-public-pr/SKILL.md"
+            ).read_text(encoding="utf-8").lower()
+
+            self.assertIn("ordinary oss publication", skill)
+            self.assertIn("no-external-links", skill)
+            self.assertIn("community", skill)
+            self.assertIn("locked-down", skill)
+
     def test_ci_pins_repository_discovery(self) -> None:
         with self.copied_repository() as repo:
             self.replace(
