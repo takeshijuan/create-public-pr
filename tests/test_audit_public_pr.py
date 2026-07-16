@@ -992,6 +992,27 @@ def test_paths_file_reports_symlink_ancestor_without_following_it(
     assert secret not in result.stdout
 
 
+def test_tracked_file_replaced_by_directory_is_incomplete(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    path = repo / "tracked.txt"
+    path.write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "add tracked file")
+    path.unlink()
+    path.mkdir()
+
+    result = audit(repo, "HEAD")
+
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == {
+        "complete": False,
+        "error": "repository validation failed",
+        "findings": [],
+        "profile": "community",
+    }
+    assert result.stderr == ""
+
+
 @pytest.mark.parametrize(
     ("category", "content"),
     [
@@ -1554,6 +1575,110 @@ def test_manifest_does_not_approve_different_intermediate_commit_bytes(
     assert secret not in result.stdout + result.stderr
 
 
+def test_manifest_rejects_intermediate_safe_symlink_blob_drift(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.symlink_to("target.txt")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add temporary fixture symlink")
+    fixture.unlink()
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "replace fixture symlink")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        base,
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
+
+
+def test_manifest_rejects_intermediate_safe_symlink_mode_change(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.symlink_to("target.txt")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add temporary fixture symlink")
+    symlink_commit = git(repo, "rev-parse", "HEAD").stdout.strip()
+    fixture.unlink()
+    fixture.write_text("target.txt", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "replace fixture symlink")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+    symlink_blob = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "show",
+            f"{symlink_commit}:tests/fixtures/public-fixture.txt",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    manifest_digest = manifest.read_text(encoding="utf-8").split()[0]
+    assert hashlib.sha256(symlink_blob).hexdigest() == manifest_digest
+
+    result = audit(
+        repo,
+        base,
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
+
+
+def test_manifest_rejects_intermediate_binary_blob_drift(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"\x00intermediate binary fixture")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add temporary binary fixture")
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "replace binary fixture")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        base,
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
+
+
 def test_manifest_digest_drift_in_staged_blob_is_incomplete(tmp_path: Path) -> None:
     repo = initialize_repo(tmp_path)
     fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
@@ -1581,6 +1706,93 @@ def test_manifest_digest_drift_in_staged_blob_is_incomplete(tmp_path: Path) -> N
     ).stdout
     assert hashlib.sha256(fixture.read_bytes()).hexdigest() == manifest_digest
     assert hashlib.sha256(staged_blob).hexdigest() != manifest_digest
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
+
+
+def test_manifest_digest_drift_in_staged_safe_symlink_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add public fixture")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+    fixture.unlink()
+    fixture.symlink_to("target.txt")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    fixture.unlink()
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    manifest_digest = manifest.read_text(encoding="utf-8").split()[0]
+    staged_blob = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "show",
+            ":tests/fixtures/public-fixture.txt",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(fixture.read_bytes()).hexdigest() == manifest_digest
+    assert hashlib.sha256(staged_blob).hexdigest() != manifest_digest
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
+
+
+def test_manifest_rejects_staged_safe_symlink_mode_change(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("target.txt", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add public fixture")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+    fixture.unlink()
+    fixture.symlink_to("target.txt")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    fixture.unlink()
+    fixture.write_text("target.txt", encoding="utf-8")
+    manifest_digest = manifest.read_text(encoding="utf-8").split()[0]
+    staged_blob = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "show",
+            ":tests/fixtures/public-fixture.txt",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(staged_blob).hexdigest() == manifest_digest
 
     result = audit(
         repo,
