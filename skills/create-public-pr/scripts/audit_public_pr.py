@@ -83,6 +83,7 @@ PUBLIC_IDENTIFIER_NUMBERS = {
     "X9": frozenset({62}),
 }
 PUBLIC_ARTIFACT_CATEGORIES = frozenset({"credential", "private-host"})
+PUBLIC_ARTIFACT_REGULAR_MODES = frozenset({b"100644", b"100755"})
 PUBLIC_ARTIFACT_PATH_COMPONENTS = frozenset(
     {
         "__fixtures__",
@@ -525,13 +526,19 @@ def load_public_artifacts(repo: Path, filename: str | None) -> dict[str, str]:
 
 
 def artifact_id_for_blob(
-    path: str, blob: bytes, public_artifacts: dict[str, str]
+    path: str,
+    blob: bytes,
+    public_artifacts: dict[str, str],
+    *,
+    mode: bytes | None = None,
 ) -> str | None:
     expected = public_artifacts.get(path)
     if expected is None:
         return None
     digest = hashlib.sha256(blob).hexdigest()
-    if digest != expected:
+    if digest != expected or (
+        mode is not None and mode not in PUBLIC_ARTIFACT_REGULAR_MODES
+    ):
         raise AuditError
     return digest
 
@@ -606,6 +613,9 @@ def scan_commits(
                     repo, "ls-tree", "-z", commit, "--", changed_path
                 ).stdout
                 mode = tree_entry.split(b" ", 1)[0]
+                artifact_id = artifact_id_for_blob(
+                    changed_path, blob, public_artifacts, mode=mode
+                )
                 if mode == b"120000":
                     target = blob.decode("utf-8", "replace")
                     findings.extend(
@@ -672,9 +682,6 @@ def scan_commits(
                             changed_path,
                         ).stdout
                         content_lines = added_lines(diff)
-                    artifact_id = artifact_id_for_blob(
-                        changed_path, blob, public_artifacts
-                    )
                     for line in content_lines:
                         findings.extend(
                             scan_content_text(
@@ -883,34 +890,38 @@ def scan_worktree(
                         index_entry = git_bytes(
                             repo, "ls-files", "--stage", "-z", "--", path
                         ).stdout
-                        if index_entry.startswith(b"120000 "):
-                            index_target = git_bytes(
-                                repo, "show", f":{path}"
-                            ).stdout.decode("utf-8", "replace")
-                            findings.extend(
-                                scan_text(
-                                    index_target,
-                                    profile=profile,
-                                    source="staged-symlink-target",
-                                    repo_identity=repo_identity,
-                                    path=path,
-                                )
+                        if index_entry:
+                            index_blob = git_bytes(repo, "show", f":{path}").stdout
+                            index_mode = index_entry.split(b" ", 1)[0]
+                            artifact_id = artifact_id_for_blob(
+                                path,
+                                index_blob,
+                                public_artifacts,
+                                mode=index_mode,
                             )
-                            if unsafe_symlink_target(path, index_target):
-                                findings.append(
-                                    make_finding(
-                                        "symlink",
-                                        profile,
-                                        "staged-symlink",
+                            if index_mode == b"120000":
+                                index_target = index_blob.decode(
+                                    "utf-8", "replace"
+                                )
+                                findings.extend(
+                                    scan_text(
+                                        index_target,
+                                        profile=profile,
+                                        source="staged-symlink-target",
+                                        repo_identity=repo_identity,
                                         path=path,
                                     )
                                 )
-                        elif index_entry:
-                            index_blob = git_bytes(repo, "show", f":{path}").stdout
-                            artifact_id = artifact_id_for_blob(
-                                path, index_blob, public_artifacts
-                            )
-                            if b"\0" in index_blob[:8192]:
+                                if unsafe_symlink_target(path, index_target):
+                                    findings.append(
+                                        make_finding(
+                                            "symlink",
+                                            profile,
+                                            "staged-symlink",
+                                            path=path,
+                                        )
+                                    )
+                            elif b"\0" in index_blob[:8192]:
                                 findings.append(
                                     make_finding(
                                         "binary",
@@ -961,7 +972,8 @@ def scan_worktree(
                 continue
             if not file_path.exists():
                 continue
-            assert current_content is not None
+            if current_content is None:
+                raise AuditError
             if b"\0" in current_content[:8192]:
                 findings.append(
                     make_finding(
