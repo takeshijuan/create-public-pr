@@ -155,6 +155,7 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
         "--title-file",
         "--body-file",
         "--commit-message-file",
+        "--public-artifacts-from",
         "--format json",
     )
     if 'scanner="$skill_root/scripts/audit_public_pr.py"' not in skill:
@@ -176,8 +177,15 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
             errors.append(f"scanner invocation missing option: {option}")
     if "exit 2" not in skill.lower() or "incomplete" not in skill.lower():
         errors.append("scanner incomplete hard-stop contract is missing")
-    if "locked-down" not in skill or "future-public" not in skill:
-        errors.append("automatic locked-down profile selection is missing")
+    profile_contract = (
+        "ordinary OSS publication",
+        "future-public",
+        "no-external-links",
+        "community",
+        "locked-down",
+    )
+    if not all(phrase.lower() in skill.lower() for phrase in profile_contract):
+        errors.append("explicit community and locked-down profile routing is missing")
 
     if 'gh pr list --head "$branch" --state open' not in skill:
         errors.append("existing PR discovery contract is missing")
@@ -227,7 +235,9 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
         'pr_head=$(gh pr view "$pr_number" --json headRefName',
         'existing_is_draft=$(gh pr view "$pr_number" --json isDraft',
         'review_file="$repo_root/.git/public-pr-review.json"',
-        "exact full key: `category`, `severity`, `source`, plus `commit` and `path_id` whenever present",
+        'public_artifacts_file="$repo_root/.git/public-pr-public-artifacts.txt"',
+        'public_artifact_args=(--public-artifacts-from "$public_artifacts_file")',
+        "exact full key: `category`, `severity`, `source`, plus `commit`, `path_id`, and `artifact_id` whenever present",
         'git diff --cached --name-only > "$staged_file"',
     ):
         if contract not in skill:

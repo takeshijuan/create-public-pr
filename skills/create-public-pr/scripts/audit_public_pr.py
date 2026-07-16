@@ -44,13 +44,48 @@ IPV6_RE = re.compile(
 )
 LOCAL_PATH_RE = re.compile(
     r"(?i)(?:file:///(?:[^\s/]+/)+[^\s/]+|"
-    r"(?<![A-Z0-9~:/\\])/(?!/)(?:[^\s/]+/)+[^\s/]+|"
+    r"(?<![A-Z0-9_.~:/\\-])/(?:Users|home|root|tmp|private|var|etc|opt|usr|"
+    r"bin|sbin|Applications|data|workspace|workspaces|Library|Volumes|mnt|srv)"
+    r"/(?:[^\s/]+/)*[^\s/]+|"
     r"(?<![A-Z0-9])[A-Z]:[\\/](?:[^\s\\/]+[\\/])*[^\s\\/]+|"
     r"(?<!\\)\\\\[^\s\\]+\\[^\s\\]+(?:\\[^\s\\]+)+|"
     r"(?<![A-Z0-9_.-])~/[^\s]+)"
 )
+SAFE_SHEBANG_RE = re.compile(
+    r"^#!(?:/" + r"usr/bin/env(?:\s+-S)?\s+[A-Za-z0-9_.+-]+(?:\s+[^\s]+)*|"
+    r"/(?:usr/)?bin/(?:bash|dash|ksh|node|perl|python[0-9.]*|ruby|sh|zsh))$"
+)
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b")
-TRACKER_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-[1-9]\d*\b")
+TRACKER_RE = re.compile(
+    r"\b([A-Z][A-Z0" + r"-9]{1,9})" + r"-[1-9]\d*\b"
+)
+PUBLIC_IDENTIFIER_NUMBERS = {
+    "AES": frozenset({128, 192, 256}),
+    "FIPS": frozenset({140, 180, 186, 197, 198, 202, 203, 204, 205, 206}),
+    "LICENSE": frozenset({2}),
+    "NIST": frozenset({800}),
+    "PKCS": frozenset(range(1, 16)),
+    "SEC": frozenset({1, 2}),
+    "SHA": frozenset({1, 224, 256, 384, 512}),
+    "SLSA": frozenset({1, 2, 3, 4}),
+    "X9": frozenset({62}),
+}
+PUBLIC_ARTIFACT_CATEGORIES = frozenset({"credential", "private-host"})
+PUBLIC_ARTIFACT_PATH_COMPONENTS = frozenset(
+    {
+        "__fixtures__",
+        "__tests__",
+        "fixture",
+        "fixtures",
+        "spec",
+        "specs",
+        "test",
+        "test-data",
+        "test_data",
+        "testdata",
+        "tests",
+    }
+)
 REPOSITORY_URL_RE = re.compile(
     r"(?i)(?:https?|ssh|git)://(?:[^\s/@]+@)?(?:www\.)?"
     r"(github\.com|gitlab\.com|bitbucket\.org)/"
@@ -151,7 +186,7 @@ def current_repository_identity(repo: Path) -> tuple[str, str, str] | None:
 
 
 def severity_for(category: str, profile: str) -> str:
-    if category in {"identity", "binary"}:
+    if category in {"identity", "binary", "public-artifact"}:
         return "review"
     if category == "repository-link" and profile == "community":
         return "review"
@@ -165,6 +200,7 @@ def make_finding(
     *,
     commit: str | None = None,
     path: str | None = None,
+    artifact_id: str | None = None,
 ) -> Finding:
     finding = {
         "category": category,
@@ -175,6 +211,8 @@ def make_finding(
         finding["commit"] = commit[:12]
     if path:
         finding["path_id"] = path_id(path)
+    if artifact_id:
+        finding["artifact_id"] = artifact_id
     return finding
 
 
@@ -212,7 +250,7 @@ def scan_text(
             continue
         if address.is_private or address.is_loopback or address.is_link_local:
             categories.add("private-host")
-    if LOCAL_PATH_RE.search(text):
+    if not SAFE_SHEBANG_RE.fullmatch(text.strip()) and LOCAL_PATH_RE.search(text):
         categories.add("local-path")
     for match in EMAIL_RE.finditer(text):
         address = match.group(0).lower()
@@ -230,7 +268,7 @@ def scan_text(
         if domain.endswith((".example", ".invalid", ".test")):
             continue
         categories.add("email")
-    if TRACKER_RE.search(text):
+    if any(not public_identifier(match) for match in TRACKER_RE.finditer(text)):
         categories.add("external-tracker")
     for match in [
         *REPOSITORY_URL_RE.finditer(text),
@@ -253,6 +291,54 @@ def scan_text(
         )
         for category in sorted(categories)
     ]
+
+
+def public_identifier(match: re.Match[str]) -> bool:
+    prefix = match.group(1)
+    number = int(match.group(0).rsplit("-", 1)[1])
+    if prefix in {"ADR", "RFC"}:
+        return True
+    return number in PUBLIC_IDENTIFIER_NUMBERS.get(prefix, ())
+
+
+def scan_content_text(
+    text: str,
+    *,
+    profile: str,
+    source: str,
+    repo_identity: tuple[str, str, str] | None,
+    commit: str | None = None,
+    path: str,
+    artifact_id: str | None = None,
+) -> list[Finding]:
+    findings = scan_text(
+        text,
+        profile=profile,
+        source=source,
+        repo_identity=repo_identity,
+        commit=commit,
+        path=path,
+    )
+    if artifact_id is None or CREDENTIAL_TOKEN_RE.search(text):
+        return findings
+    retained = [
+        finding
+        for finding in findings
+        if finding["category"] not in PUBLIC_ARTIFACT_CATEGORIES
+    ]
+    if len(retained) == len(findings):
+        return findings
+    retained.append(
+        make_finding(
+            "public-artifact",
+            profile,
+            source,
+            commit=commit,
+            path=path,
+            artifact_id=artifact_id,
+        )
+    )
+    return retained
 
 
 def added_lines(diff: bytes, prefix_width: int = 1) -> list[str]:
@@ -345,11 +431,68 @@ def symlink_path_component(repo: Path, path: str) -> tuple[str, str, bool] | Non
     return None
 
 
+def load_public_artifacts(repo: Path, filename: str | None) -> dict[str, str]:
+    if filename is None:
+        return {}
+    try:
+        rows = Path(filename).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise AuditError from exc
+    artifacts: dict[str, str] = {}
+    for raw_row in rows:
+        if not raw_row.strip() or raw_row.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", raw_row)
+        if match is None:
+            raise AuditError
+        digest, path = match.groups()
+        relative = PurePosixPath(path)
+        if (
+            any(ord(character) < 32 or ord(character) == 127 for character in path)
+            or path != relative.as_posix()
+            or relative.is_absolute()
+            or relative.as_posix() in {"", "."}
+            or ".." in relative.parts
+            or ".git" in relative.parts
+            or "\\" in path
+            or path in artifacts
+        ):
+            raise AuditError
+        if not any(
+            component.lower() in PUBLIC_ARTIFACT_PATH_COMPONENTS
+            for component in relative.parts
+        ):
+            raise AuditError
+        try:
+            if symlink_path_component(repo, path) is not None:
+                raise AuditError
+            file_path = repo / path
+            if not file_path.is_file():
+                raise AuditError
+            if hashlib.sha256(file_path.read_bytes()).hexdigest() != digest:
+                raise AuditError
+        except (OSError, ValueError) as exc:
+            raise AuditError from exc
+        artifacts[path] = digest
+    return artifacts
+
+
+def artifact_id_for_blob(
+    path: str, blob: bytes, public_artifacts: dict[str, str]
+) -> str | None:
+    expected = public_artifacts.get(path)
+    if expected is None:
+        return None
+    digest = hashlib.sha256(blob).hexdigest()
+    return digest if digest == expected else None
+
+
 def scan_commits(
     repo: Path,
     base: str,
     profile: str,
     repo_identity: tuple[str, str, str] | None,
+    public_artifacts: dict[str, str],
 ) -> list[Finding]:
     try:
         commits = git(
@@ -370,7 +513,6 @@ def scan_commits(
                     "-z",
                     commit,
                 ).stdout.split(b"\0")
-                content_lines: list[str] = []
             elif parents:
                 parent = parents[0]
                 changed_paths = git_bytes(
@@ -384,18 +526,6 @@ def scan_commits(
                     commit,
                     "--",
                 ).stdout.split(b"\0")
-                diff = git_bytes(
-                    repo,
-                    "diff",
-                    "--text",
-                    "--no-textconv",
-                    "--no-ext-diff",
-                    "--unified=0",
-                    parent,
-                    commit,
-                    "--",
-                ).stdout
-                content_lines = added_lines(diff)
             else:
                 changed_paths = git_bytes(
                     repo,
@@ -408,18 +538,6 @@ def scan_commits(
                     "-z",
                     commit,
                 ).stdout.split(b"\0")
-                diff = git_bytes(
-                    repo,
-                    "show",
-                    "--root",
-                    "--format=",
-                    "--text",
-                    "--no-textconv",
-                    "--no-ext-diff",
-                    "--unified=0",
-                    commit,
-                ).stdout
-                content_lines = added_lines(diff)
             for raw_path in changed_paths:
                 if not raw_path:
                     continue
@@ -471,28 +589,55 @@ def scan_commits(
                             path=changed_path,
                         )
                     )
-                elif len(parents) > 1:
-                    for line in merge_added_lines(repo, parents, commit, changed_path):
+                else:
+                    if len(parents) > 1:
+                        content_lines = merge_added_lines(
+                            repo, parents, commit, changed_path
+                        )
+                    elif parents:
+                        diff = git_bytes(
+                            repo,
+                            "diff",
+                            "--text",
+                            "--no-textconv",
+                            "--no-ext-diff",
+                            "--unified=0",
+                            parents[0],
+                            commit,
+                            "--",
+                            changed_path,
+                        ).stdout
+                        content_lines = added_lines(diff)
+                    else:
+                        diff = git_bytes(
+                            repo,
+                            "show",
+                            "--root",
+                            "--format=",
+                            "--text",
+                            "--no-textconv",
+                            "--no-ext-diff",
+                            "--unified=0",
+                            commit,
+                            "--",
+                            changed_path,
+                        ).stdout
+                        content_lines = added_lines(diff)
+                    artifact_id = artifact_id_for_blob(
+                        changed_path, blob, public_artifacts
+                    )
+                    for line in content_lines:
                         findings.extend(
-                            scan_text(
+                            scan_content_text(
                                 line,
                                 profile=profile,
                                 source="committed-content",
                                 repo_identity=repo_identity,
                                 commit=commit,
                                 path=changed_path,
+                                artifact_id=artifact_id,
                             )
                         )
-            for line in content_lines:
-                findings.extend(
-                    scan_text(
-                        line,
-                        profile=profile,
-                        source="committed-content",
-                        repo_identity=repo_identity,
-                        commit=commit,
-                    )
-                )
             message = git(repo, "show", "-s", "--format=%B", commit).stdout
             findings.extend(
                 scan_text(
@@ -635,10 +780,15 @@ def scan_worktree(
     profile: str,
     repo_identity: tuple[str, str, str] | None,
     paths_from: str | None,
+    public_artifacts: dict[str, str],
 ) -> list[Finding]:
     findings: list[Finding] = []
     try:
         for path, untracked in selected_worktree_paths(repo, paths_from):
+            file_path = repo / path
+            link_component = symlink_path_component(repo, path)
+            if not untracked and link_component is None and not file_path.exists():
+                continue
             findings.extend(
                 scan_text(
                     path,
@@ -648,7 +798,11 @@ def scan_worktree(
                     path=path,
                 )
             )
-            file_path = repo / path
+            current_content = (
+                file_path.read_bytes()
+                if link_component is None and file_path.is_file()
+                else None
+            )
             if not untracked:
                 for source, diff_args in (
                     (
@@ -675,6 +829,7 @@ def scan_worktree(
                     ),
                 ):
                     diff = git_bytes(repo, *diff_args, "--", path).stdout
+                    artifact_id = None
                     if source == "staged-content" and diff:
                         index_entry = git_bytes(
                             repo, "ls-files", "--stage", "-z", "--", path
@@ -703,6 +858,9 @@ def scan_worktree(
                                 )
                         elif index_entry:
                             index_blob = git_bytes(repo, "show", f":{path}").stdout
+                            artifact_id = artifact_id_for_blob(
+                                path, index_blob, public_artifacts
+                            )
                             if b"\0" in index_blob[:8192]:
                                 findings.append(
                                     make_finding(
@@ -712,17 +870,21 @@ def scan_worktree(
                                         path=path,
                                     )
                                 )
+                    elif source == "worktree-content" and current_content is not None:
+                        artifact_id = artifact_id_for_blob(
+                            path, current_content, public_artifacts
+                        )
                     for line in added_lines(diff):
                         findings.extend(
-                            scan_text(
+                            scan_content_text(
                                 line,
                                 profile=profile,
                                 source=source,
                                 repo_identity=repo_identity,
                                 path=path,
+                                artifact_id=artifact_id,
                             )
                         )
-            link_component = symlink_path_component(repo, path)
             if link_component is not None:
                 component_path, target, is_final = link_component
                 findings.extend(
@@ -750,7 +912,7 @@ def scan_worktree(
                 continue
             if not file_path.exists():
                 continue
-            current_content = file_path.read_bytes()
+            assert current_content is not None
             if b"\0" in current_content[:8192]:
                 findings.append(
                     make_finding(
@@ -766,14 +928,16 @@ def scan_worktree(
                 lines = content.splitlines()
             else:
                 lines = []
+            artifact_id = artifact_id_for_blob(path, current_content, public_artifacts)
             for line in lines:
                 findings.extend(
-                    scan_text(
+                    scan_content_text(
                         line,
                         profile=profile,
                         source="worktree-content",
                         repo_identity=repo_identity,
                         path=path,
+                        artifact_id=artifact_id,
                     )
                 )
         return findings
@@ -829,6 +993,8 @@ def print_result(result: dict[str, object], output_format: str) -> None:
             details.append(f"commit={finding['commit']}")
         if "path_id" in finding:
             details.append(f"path_id={finding['path_id']}")
+        if "artifact_id" in finding:
+            details.append(f"artifact_id={finding['artifact_id']}")
         print("- " + " ".join(details))
 
 
@@ -843,6 +1009,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--title-file")
     parser.add_argument("--body-file")
     parser.add_argument("--commit-message-file")
+    parser.add_argument("--public-artifacts-from")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     return parser.parse_args()
 
@@ -853,15 +1020,30 @@ def main() -> int:
         repo = validate_repository(args.repo)
         branch = validate_base(repo, args.base)
         repo_identity = current_repository_identity(repo)
+        public_artifacts = load_public_artifacts(repo, args.public_artifacts_from)
         findings = scan_text(
             branch,
             profile=args.profile,
             source="branch-name",
             repo_identity=repo_identity,
         )
-        findings.extend(scan_commits(repo, args.base, args.profile, repo_identity))
         findings.extend(
-            scan_worktree(repo, args.profile, repo_identity, args.paths_from)
+            scan_commits(
+                repo,
+                args.base,
+                args.profile,
+                repo_identity,
+                public_artifacts,
+            )
+        )
+        findings.extend(
+            scan_worktree(
+                repo,
+                args.profile,
+                repo_identity,
+                args.paths_from,
+                public_artifacts,
+            )
         )
         findings.extend(
             scan_proposals(
@@ -874,6 +1056,9 @@ def main() -> int:
                 ),
             )
         )
+        if args.public_artifacts_from is not None:
+            if load_public_artifacts(repo, args.public_artifacts_from) != public_artifacts:
+                raise AuditError
         findings = deduplicate(findings)
     except AuditError:
         result = {

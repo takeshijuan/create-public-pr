@@ -171,6 +171,78 @@ class AuditReviewComparatorTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_exact_public_artifact_review_passes_in_locked_down_profile(
+        self,
+    ) -> None:
+        finding = {
+            "category": "public-artifact",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+            "path_id": "abcdef012345",
+            "artifact_id": "1" * 64,
+        }
+        audit = self.audit_payload([finding])
+        audit["profile"] = "locked-down"
+        record = self.review_record(
+            category="public-artifact",
+            path_id="abcdef012345",
+            artifact_id="1" * 64,
+            checks={
+                "public_without_credentials": "pass",
+                "relevant_to_change": "pass",
+                "no_internal_context": "pass",
+                "provenance_and_license": "pass",
+                "upstream_bytes_match": "pass",
+            },
+            rationale="Checksum pinned public fixture with verified license.",
+        )
+
+        result = self.run_comparator(audit, [record])
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_public_artifact_review_digest_must_match_exactly(self) -> None:
+        finding = {
+            "category": "public-artifact",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+            "path_id": "abcdef012345",
+            "artifact_id": "1" * 64,
+        }
+        record = self.review_record(
+            category="public-artifact",
+            path_id="abcdef012345",
+            artifact_id="2" * 64,
+            checks={
+                "public_without_credentials": "pass",
+                "relevant_to_change": "pass",
+                "no_internal_context": "pass",
+                "provenance_and_license": "pass",
+                "upstream_bytes_match": "pass",
+            },
+            rationale="Checksum pinned public fixture with verified license.",
+        )
+
+        result = self.run_comparator(self.audit_payload([finding]), [record])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("review records do not exactly match findings", result.stdout)
+
+    def test_public_artifact_finding_requires_path_and_digest(self) -> None:
+        finding = {
+            "category": "public-artifact",
+            "severity": "review",
+            "source": "committed-content",
+            "commit": "0123456789ab",
+        }
+
+        result = self.run_comparator(self.audit_payload([finding]), [])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("audit finding schema is invalid", result.stdout)
+
     def test_blocking_finding_always_stops_without_echoing_payload(self) -> None:
         finding = {
             "category": "credential",

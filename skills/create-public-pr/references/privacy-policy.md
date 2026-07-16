@@ -8,7 +8,7 @@ Only the scanner may inspect potentially sensitive values. Reports expose catego
 
 ## Profiles and outcomes
 
-Use `community` unless repository instructions require future-public or no-internal-links handling. `community` marks an external repository link for review so its public status and relevance can be proven. Use `locked-down` automatically for stricter repositories; every cross-repository link or external tracker reference is then blocking.
+Use `community` for ordinary OSS publication, including repositories described only as future-public. It marks an external repository link for review so its public status and relevance can be proven. Use `locked-down` only when repository instructions explicitly require no-external-links, no-internal-links, or an equivalent prohibition; every cross-repository link is then blocking.
 
 Scanner outcomes are fixed:
 
@@ -18,11 +18,11 @@ Scanner outcomes are fixed:
 | Exit 1 | Blocking or review findings | Remediate or complete every allowed manual review |
 | Exit 2 | Invalid input, Git failure, or incomplete scan | Stop immediately |
 
-Credentials, private keys, credential-bearing URLs, collaboration-tool URLs, private/local hosts, local filesystem paths, non-example emails, external trackers, unsafe symlinks, and locked-down external repository links are hard blocks. Generic product names such as Slack, Notion, or ClickUp may identify a prohibited category, but links or internal context from those systems must not enter a public PR.
+Private keys, raw credential-token shapes, credential-bearing URLs, collaboration-tool URLs, local filesystem paths, non-example emails, external trackers, unsafe symlinks, and locked-down external repository links are hard blocks. Credential-assignment or private-host-shaped text remains blocking unless it is content in an exact checksum-bound public artifact reviewed under the rule below. Generic product names such as Slack, Notion, or ClickUp may identify a prohibited category, but links or internal context from those systems must not enter a public PR.
 
 ## Manual-review evidence
 
-Only `repository-link` under `community`, `binary`, and `identity` findings are eligible for manual resolution. Store a JSON array at `.git/public-pr-review.json`, keep it out of commits, and create one object per finding without including the matched value. Include `commit` and `path_id` if and only if the finding contains them:
+Only `repository-link` under `community`, `binary`, `identity`, and `public-artifact` findings are eligible for manual resolution. Store a JSON array at `.git/public-pr-review.json`, keep it out of commits, and create one object per finding without including the matched value. Include `commit`, `path_id`, and `artifact_id` if and only if the finding contains them:
 
 ```json
 [
@@ -45,9 +45,13 @@ Only `repository-link` under `community`, `binary`, and `identity` findings are 
 ]
 ```
 
-For a community repository link, independently confirm public access without private credentials, direct relevance, and absence of internal context. For a binary, set the first two checks to `not-applicable`, verify no internal context plus provenance/license, and avoid printing extracted strings. For an identity, only the no-internal-context check is `pass`; the other checks are `not-applicable`. If the decision is remove or replace, remediate and rerun the audit instead of retaining a record. Never expose an address.
+For a community repository link, independently confirm public access without private credentials, direct relevance, and absence of internal context. For a binary, set the first two checks to `not-applicable`, verify no internal context plus provenance/license, and avoid printing extracted strings. For an identity, only the no-internal-context check is `pass`; the other checks are `not-applicable`.
 
-An assertion of harmlessness, a successful page load with private credentials, or a clean final diff is not evidence. The standard-library comparator rejects every blocking finding and matches the exact one-to-one set of eligible findings by category, severity, source, commit when present, and path identifier when present. Duplicate, unexpected, stale, missing, or invalid records stop the workflow. If verification is inconclusive, remove or replace the material.
+For a retained public upstream fixture whose literal test data resembles a credential assignment or private host, create `.git/public-pr-public-artifacts.txt` with one line per artifact in the exact form `<lowercase SHA-256><two spaces><repo-relative path>`. The path must identify a current regular file with no symlink component and include a recognized test or fixture directory component. Independently verify unauthenticated public access, byte-for-byte equality with the named upstream source, relevance to the change, absence of internal context, and license or NOTICE coverage. The five structured review checks, including `upstream_bytes_match`, must pass. The scanner binds the review to the safe path identifier and full artifact digest, and validates each commit blob independently. A malformed row, duplicate path, non-test path, control character, absolute or parent path, symlink, missing file, or digest mismatch makes the audit incomplete. This mechanism never makes private keys, raw token shapes, credential URLs, collaboration links, proposal text, branch names, commit messages, identities, or runtime source/configuration files reviewable.
+
+If the decision is remove or replace, remediate and rerun the audit instead of retaining a record. Never expose an address.
+
+An assertion of harmlessness, a successful page load with private credentials, or a clean final diff is not evidence. The standard-library comparator rejects every blocking finding and matches the exact one-to-one set of eligible findings by category, severity, source, commit when present, path identifier when present, and artifact digest when present. Duplicate, unexpected, stale, missing, or invalid records stop the workflow. If verification is inconclusive, remove or replace the material.
 
 ## History and scope boundaries
 

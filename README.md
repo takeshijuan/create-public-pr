@@ -28,7 +28,8 @@ npx --yes skills@1.5.17 add . --list
 - Complete history and worktree scanning without printing matched sensitive values.
 - Exact staging, repository-local GitHub noreply identity, normal pushes, draft creation, and existing-PR refresh.
 - No implicit reviewers, labels, projects, milestones, merges, deployments, history rewrites, or force-pushes.
-- A stricter `locked-down` profile for future-public or no-internal-links repositories.
+- A `community` profile for ordinary OSS publication and a stricter `locked-down` profile only for explicit no-external-links or no-internal-links policies.
+- Exact SHA-256-bound review evidence for retained public upstream fixtures whose literal test data resembles a credential assignment or private host.
 
 The scanner uses only the Python standard library at runtime and supports Python 3.10 and newer.
 
@@ -38,7 +39,8 @@ This release is a beta with deliberately conservative stop conditions.
 
 - The scanner is heuristic and cannot prove that every form of sensitive or proprietary context is absent. Review the proposed public surface and complete every required manual-review record.
 - The documented GitHub mutation paths are tested with a deterministic fake `gh`; repository tests do not create or refresh a live GitHub pull request.
-- Community-profile repository links, changed binaries, and non-noreply commit identities require explicit review evidence. Locked-down blocking findings cannot be waived.
+- Community-profile repository links, changed binaries, non-noreply commit identities, and checksum-bound public fixtures require explicit review evidence. Locked-down blocking findings cannot be waived.
+- Public-artifact review is intentionally narrow: malformed manifests, digest drift, symlinks, raw credential-token shapes, private keys, and credential-bearing URLs still stop the workflow.
 - The skill prepares or refreshes pull requests only. It does not merge, deploy, rewrite history, or force-push.
 
 ## Validate a checkout

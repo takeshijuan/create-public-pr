@@ -16,7 +16,7 @@ Read [privacy-policy.md](references/privacy-policy.md) before resolving findings
 1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, default base, working tree, existing branch commits, and any open PR for the head branch. Stop on detached HEAD, an ambiguous PR, an unexpected base, or incomplete repository access.
 2. **Scope.** Name the intended change and obtain an explicit path or hunk boundary. Treat staged and untracked content as observations, not authorization. If approved and unrelated changes are mixed, stop and confirm the exact scope; do not use stash, reset, restore, or destructive index manipulation to separate it without authorization.
 3. **Branch.** Enforce a focused non-default branch with only related commits. When the current branch is the base, create a branch using the repository convention or `codex/<short-description>`. Require the branch to differ from the base and `origin/$base` to be an ancestor of `HEAD`. If sensitive material exists in published history, do not amend, rebase, reset, or force-push. Stop before changing PR strategy; a clean replacement branch and replacement PR require explicit user authorization.
-4. **Prepare.** Follow the repository template. Write the title, body, commit message, confirmed repo-relative paths, audit output, and manual-review records to files inside `.git/`. Follow the repository's commit convention; when none exists, use Conventional Commits. Resolve the skill directory from the loaded `SKILL.md`; never assume the target repository contains the scanner. Select `locked-down` when repository instructions say future-public, no-internal-links, or equivalent; otherwise select `community`.
+4. **Prepare.** Follow the repository template. Write the title, body, commit message, confirmed repo-relative paths, audit output, and manual-review records to files inside `.git/`. Follow the repository's commit convention; when none exists, use Conventional Commits. Resolve the skill directory from the loaded `SKILL.md`; never assume the target repository contains the scanner. Use `community` for ordinary OSS publication, including repositories described only as future-public. Select `locked-down` only when repository instructions explicitly impose no-external-links, no-internal-links, or an equivalent prohibition.
 5. **Audit.** Run the scanner and audit/review comparator exactly as shown below. Exit 2 or an incomplete result is a hard stop. Exit 1 may continue only after a review file exists and the comparator proves an exact record for every eligible finding and no blocking finding; never weaken the profile, omit inputs, or substitute commands that print matched values.
 6. **Validate.** Run the repository's relevant tests and checks. Resolve every blocking finding. Resolve each review finding using the evidence contract in the privacy reference.
 7. **Stage.** Stage only confirmed paths or hunks with explicit pathspecs. Compare the staged set to the approved scope without printing raw paths, then run `git diff --cached --check`. Never use broad staging for a mixed worktree.
@@ -30,8 +30,9 @@ Read [privacy-policy.md](references/privacy-policy.md) before resolving findings
 |---|---|
 | `community` repository-link review | Verify it is public without credentials, relevant, and free of internal context; record evidence |
 | `locked-down` repository-link | Remove or replace it; it is blocking |
+| Checksum-bound public test artifact | Require a test/fixture-owned path; verify exact upstream bytes, relevance, public access, provenance, and license |
 | Binary or non-noreply identity | Complete the manual-review record or remove/replace the affected material |
-| Unsafe symlink, credential, private context | Remediate; never waive a blocking category |
+| Unsafe symlink, raw token, private key, or unverified private context | Remediate; never waive a blocking category |
 | Mixed staged/untracked scope | Stop and obtain an exact scope without destructive index changes |
 | Sensitive material in published history | Stop; no rewrite or force-push; replacement needs explicit authorization |
 | Scanner exit 2 / incomplete | Stop; no commit, push, create, or refresh |
@@ -40,7 +41,7 @@ Read [privacy-policy.md](references/privacy-policy.md) before resolving findings
 
 Replace the angle-bracket path lists with the confirmed repository-relative paths and replace `short-description` with the focused branch slug. Keep proposal files under `.git/` so they cannot be committed accidentally.
 
-```sh
+```bash
 repo_root=$(git rev-parse --show-toplevel) || exit 2
 cd "$repo_root" || exit 2
 branch=$(git branch --show-current)
@@ -74,6 +75,7 @@ comparator="$skill_root/scripts/validate_audit_review.py"
 test -f "$scanner" || exit 2
 test -f "$comparator" || exit 2
 paths_file="$repo_root/.git/public-pr-paths.txt"
+public_artifacts_file="$repo_root/.git/public-pr-public-artifacts.txt"
 title_file="$repo_root/.git/public-pr-title.txt"
 body_file="$repo_root/.git/public-pr-body.md"
 commit_message_file="$repo_root/.git/public-pr-commit.txt"
@@ -81,6 +83,10 @@ audit_file="$repo_root/.git/public-pr-audit.json"
 review_file="$repo_root/.git/public-pr-review.json"
 staged_file="$repo_root/.git/public-pr-staged.txt"
 diff_check_file="$repo_root/.git/public-pr-diff-check.txt"
+public_artifact_args=()
+if test -f "$public_artifacts_file"; then
+  public_artifact_args=(--public-artifacts-from "$public_artifacts_file")
+fi
 printf '%s\n' <confirmed-paths> > "$paths_file"
 IFS= read -r title < "$title_file"
 
@@ -88,6 +94,7 @@ python3 "$scanner" \
   --repo "$repo_root" --base "origin/$base" --profile "$profile" \
   --paths-from "$paths_file" --title-file "$title_file" \
   --body-file "$body_file" --commit-message-file "$commit_message_file" \
+  "${public_artifact_args[@]}" \
   --format json > "$audit_file"
 audit_status=$?
 case "$audit_status" in
@@ -110,6 +117,7 @@ python3 "$scanner" \
   --repo "$repo_root" --base "origin/$base" --profile "$profile" \
   --paths-from "$paths_file" --title-file "$title_file" \
   --body-file "$body_file" --commit-message-file "$commit_message_file" \
+  "${public_artifact_args[@]}" \
   --format json > "$audit_file"
 audit_status=$?
 case "$audit_status" in
@@ -122,7 +130,7 @@ python3 "$comparator" --audit-file "$audit_file" --review-file "$review_file" ||
 git push -u origin "$branch" || exit 2
 ```
 
-When audit exit 1 contains only eligible review findings, pause to write the records defined in the privacy reference to `public-pr-review.json`, then resume at the comparator. It compares the exact full key: `category`, `severity`, `source`, plus `commit` and `path_id` whenever present. It rejects blocking findings, duplicates, unexpected/stale/missing records, invalid checks, and non-approved decisions without echoing values. Run it after each audit; an assertion without the file and successful comparator is not resolution.
+When audit exit 1 contains only eligible review findings, pause to write the records defined in the privacy reference to `public-pr-review.json`, then resume at the comparator. It compares the exact full key: `category`, `severity`, `source`, plus `commit`, `path_id`, and `artifact_id` whenever present. It rejects blocking findings, duplicates, unexpected/stale/missing records, invalid checks, and non-approved decisions without echoing values. Run it after each audit; an assertion without the file and successful comparator is not resolution.
 
 After the open-PR query returns exactly one result, set its number and refresh it:
 
@@ -153,5 +161,5 @@ gh pr view "$pr_number" --json number,url,isDraft,baseRefName,headRefName,state,
 - A maintainer assertion is not evidence that an external link or binary is public-safe.
 - A review finding is not clean until its structured resolution is recorded.
 - Never print matched values, raw potentially sensitive names or paths, addresses, URLs, tokens, or binary strings while investigating; use only safe identifiers.
-- Never bypass the scanner, omit proposal files, downgrade `locked-down`, use broad staging, create a duplicate PR, rewrite published history, or force-push.
+- Never bypass the scanner, omit proposal files, downgrade an explicitly required `locked-down` policy, use broad staging, create a duplicate PR, rewrite published history, or force-push.
 - Stop if any required fact, scan, test, manual review, or verification is incomplete.

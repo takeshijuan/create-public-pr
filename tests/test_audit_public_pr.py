@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import inspect
 import subprocess
@@ -87,6 +88,16 @@ def audit(
         text=True,
         capture_output=True,
     )
+
+
+def write_public_artifact_manifest(repo: Path, *relative_paths: str) -> Path:
+    manifest = repo / ".git" / "public-pr-public-artifacts.txt"
+    rows = []
+    for relative_path in relative_paths:
+        digest = hashlib.sha256((repo / relative_path).read_bytes()).hexdigest()
+        rows.append(f"{digest}  {relative_path}")
+    manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return manifest
 
 
 def install_raw_commit(repo: Path, invalid_field: str) -> str:
@@ -451,6 +462,44 @@ def test_scans_changed_filenames_without_printing_them(tmp_path: Path) -> None:
     )
     assert marker not in result.stdout
     assert filename not in result.stdout
+
+
+def test_deleted_existing_sensitive_path_is_not_new_public_content(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    marker = "PRIVATE" + "-902"
+    filename = f"notes-{marker}.txt"
+    (repo / filename).write_text("legacy content\n", encoding="utf-8")
+    git(repo, "add", filename)
+    git(repo, "commit", "-m", "add legacy path")
+    git(repo, "rm", filename)
+
+    result = audit(repo, "HEAD")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+    assert marker not in result.stdout + result.stderr
+
+
+def test_rename_to_sensitive_path_is_still_blocked(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
+    git(repo, "add", "safe.txt")
+    git(repo, "commit", "-m", "add safe path")
+    marker = "PRIVATE" + "-903"
+    filename = f"notes-{marker}.txt"
+    git(repo, "mv", "safe.txt", filename)
+
+    result = audit(repo, "HEAD")
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "external-tracker"
+        and finding["source"] == "worktree-path"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert marker not in result.stdout + result.stderr
 
 
 def test_scans_tracked_and_untracked_worktree_changes(tmp_path: Path) -> None:
@@ -1109,7 +1158,16 @@ def test_paths_file_dot_selects_changed_paths_from_repo_root(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     "local_path",
     [
-        "/etc/" + "ssh/config",
+        "/" + "etc/ssh/config",
+        "/" + "home/private-user/project",
+        "/" + "tmp/private-work/project",
+        "/" + "opt/private-work/project",
+        "/" + "var/private-work/project",
+        "/" + "private/var/private-work/project",
+        "/" + "workspace/private-work/project",
+        "/" + "usr/local/private-work/project",
+        "/" + "Applications/PrivateTool.app/Contents",
+        "/" + "data/private-work/project",
         "~/" + "Library/private-data",
         "D:\\workspace\\" + "private-data",
         "\\\\fileserver\\share\\" + "private-data",
@@ -1139,6 +1197,12 @@ def test_detects_general_unix_and_windows_absolute_paths(
         "docs/guides/setup.md",
         "https://" + "example.com/etc/ssh/config",
         "ordinary slash/containing prose",
+        "#!" + "/" + "usr/bin/env bash",
+        "#!" + "/" + "bin/sh",
+        "#!" + "/" + "usr/bin/python3",
+        "redirect output to /dev/null",
+        "/api/v1/public/resource",
+        "/public/v1/resource",
     ],
 )
 def test_does_not_treat_relative_prose_or_urls_as_local_paths(
@@ -1174,6 +1238,405 @@ def test_does_not_treat_unity_tilde_directory_as_local_path(
 
     assert result.returncode == 0
     assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "ordinary_relative_path",
+    [
+        "tests/generated_/nested/file.txt",
+        "docs/generated./nested/file.txt",
+        "docs/generated-/nested/file.txt",
+        "../../tests/fixtures/public.json",
+    ],
+)
+def test_does_not_treat_punctuated_relative_paths_as_absolute(
+    tmp_path: Path, ordinary_relative_path: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(ordinary_relative_path + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add relative path")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "public_identifier",
+    [
+        "RFC-9180",
+        "AES-256",
+        "SHA-256",
+        "LICENSE-2",
+        "PKCS-8",
+        "FIPS-186",
+        "NIST-800",
+        "SEC-1",
+        "SLSA-1",
+        "X9-62",
+        "ADR-12",
+    ],
+)
+def test_does_not_treat_public_technical_identifiers_as_trackers(
+    tmp_path: Path, public_identifier: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(public_identifier + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add public standard")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "tracker_identifier",
+    [
+        "SEC" + "-8472",
+        "AES" + "-999",
+        "FIPS" + "-999",
+        "SHA" + "-999",
+        "SLSA" + "-9",
+    ],
+)
+def test_unknown_numbers_with_public_prefixes_remain_blocking(
+    tmp_path: Path, tracker_identifier: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(tracker_identifier + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add unknown identifier")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "external-tracker"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert tracker_identifier not in result.stdout + result.stderr
+
+
+def test_hash_pinned_public_artifact_is_reviewable(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(
+        "api_" + "key = public-fixture-" + "A" * 24 + "\n"
+        "http://" + "local" + "host:3000/public-test\n",
+        encoding="utf-8",
+    )
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert len(findings) == 1
+    assert findings[0]["category"] == "public-artifact"
+    assert findings[0]["severity"] == "review"
+    assert findings[0]["source"] == "worktree-content"
+    assert findings[0].get("path_id")
+    assert len(findings[0].get("artifact_id", "")) == 64
+
+
+def test_hash_pinned_committed_public_artifact_is_reviewable(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(
+        "api_" + "key = public-fixture-" + "D" * 24 + "\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add public fixture")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        base,
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert len(findings) == 1
+    assert findings[0]["category"] == "public-artifact"
+    assert findings[0]["source"] == "committed-content"
+    assert findings[0].get("commit")
+    assert findings[0].get("path_id")
+    assert len(findings[0].get("artifact_id", "")) == 64
+
+
+def test_public_artifact_manifest_cannot_approve_private_key(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    marker = "-----BEGIN " + "PRIVATE KEY-----"
+    fixture.write_text(marker + "\npublic fixture\n", encoding="utf-8")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "private-key"
+        and finding["severity"] == "blocking"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert marker not in result.stdout + result.stderr
+
+
+def test_public_artifact_manifest_does_not_approve_repository_link(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-source.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(
+        "https://" + "github.com/example/upstream\n",
+        encoding="utf-8",
+    )
+    manifest = write_public_artifact_manifest(repo, "tests/fixtures/public-source.txt")
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--profile",
+        "locked-down",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(
+        finding["category"] == "repository-link"
+        and finding["severity"] == "blocking"
+        for finding in findings
+    )
+    assert not any(
+        finding["category"] == "public-artifact" for finding in findings
+    )
+
+
+def test_public_artifact_manifest_hash_mismatch_is_incomplete(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("public fixture\n", encoding="utf-8")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+    fixture.write_text(
+        "api_" + "key = changed-after-review-" + "B" * 24 + "\n",
+        encoding="utf-8",
+    )
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
+    assert "changed-after-review" not in result.stdout + result.stderr
+
+
+def test_manifest_does_not_approve_different_intermediate_commit_bytes(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    secret = "api_" + "key = intermediate-" + "C" * 24
+    fixture.write_text(secret + "\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add temporary fixture")
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "replace fixture")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        base,
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "credential"
+        and finding["source"] == "committed-content"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert secret not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "credential_text",
+    [
+        "AK" + "IA" + "A" * 16,
+        "gh" + "p_" + "A" * 36,
+        "Bearer " + "A" * 24,
+    ],
+)
+def test_public_artifact_manifest_cannot_approve_token_shapes(
+    tmp_path: Path, credential_text: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(credential_text + "\n", encoding="utf-8")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(
+        finding["category"] == "credential"
+        and finding["severity"] == "blocking"
+        for finding in findings
+    )
+    assert credential_text not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "manifest_row",
+    [
+        "not-a-digest  tests/fixtures/public-fixture.txt",
+        "0" * 64 + " tests/fixtures/public-fixture.txt",
+        "0" * 64 + "  /tests/fixtures/public-fixture.txt",
+        "0" * 64 + "  ../public-fixture.txt",
+        "0" * 64 + "  tests/../public-fixture.txt",
+        "0" * 64 + "  tests/fixtures/public\0fixture.txt",
+    ],
+)
+def test_public_artifact_manifest_rejects_malformed_or_unsafe_rows(
+    tmp_path: Path, manifest_row: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    manifest = repo / ".git" / "public-pr-public-artifacts.txt"
+    manifest.write_text(manifest_row + "\n", encoding="utf-8")
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["complete"] is False
+
+
+def test_public_artifact_manifest_rejects_duplicate_paths(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("public fixture\n", encoding="utf-8")
+    digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    manifest = repo / ".git" / "public-pr-public-artifacts.txt"
+    row = f"{digest}  tests/fixtures/public-fixture.txt\n"
+    manifest.write_text(row + row, encoding="utf-8")
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["complete"] is False
+
+
+def test_public_artifact_manifest_rejects_symlink_paths(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    fixtures = repo / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    target = fixtures / "target.txt"
+    target.write_text("public fixture\n", encoding="utf-8")
+    link = fixtures / "public-fixture.txt"
+    link.symlink_to("target.txt")
+    digest = hashlib.sha256(link.read_bytes()).hexdigest()
+    manifest = repo / ".git" / "public-pr-public-artifacts.txt"
+    manifest.write_text(
+        f"{digest}  tests/fixtures/public-fixture.txt\n", encoding="utf-8"
+    )
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["complete"] is False
+
+
+def test_public_artifact_manifest_rejects_runtime_source_paths(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    source = repo / "src" / "runtime-config.txt"
+    source.parent.mkdir()
+    source.write_text(
+        "api_" + "key = runtime-value-" + "A" * 24 + "\n",
+        encoding="utf-8",
+    )
+    manifest = write_public_artifact_manifest(repo, "src/runtime-config.txt")
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["complete"] is False
 
 
 def test_flags_binary_introduced_only_by_merge_conflict_resolution(
