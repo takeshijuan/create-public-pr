@@ -177,15 +177,49 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
             errors.append(f"scanner invocation missing option: {option}")
     if "exit 2" not in skill.lower() or "incomplete" not in skill.lower():
         errors.append("scanner incomplete hard-stop contract is missing")
-    profile_contract = (
-        "ordinary OSS publication",
-        "future-public",
-        "no-external-links",
-        "community",
-        "locked-down",
+    profile_routing_clauses = (
+        "Use `community` for ordinary OSS publication, including repositories "
+        "described only as future-public.",
+        "Select `locked-down` only when repository instructions explicitly impose "
+        "no-external-links, no-internal-links, or an equivalent prohibition.",
     )
-    if not all(phrase.lower() in skill.lower() for phrase in profile_contract):
+    if not all(clause in skill for clause in profile_routing_clauses):
         errors.append("explicit community and locked-down profile routing is missing")
+    profile_setup_instruction = (
+        "Before running the sequence, set `CREATE_PUBLIC_PR_PROFILE` to the "
+        "profile selected in step 4."
+    )
+    profile_selection_block = "\n".join(
+        (
+            "readonly profile=${CREATE_PUBLIC_PR_PROFILE:?select community or "
+            "locked-down from repository instructions}",
+            'case "$profile" in',
+            "  community|locked-down) ;;",
+            "  *) exit 2 ;;",
+            "esac",
+        )
+    )
+    if (
+        profile_setup_instruction not in skill
+        or profile_selection_block not in skill
+    ):
+        errors.append("executable profile selection contract is missing")
+    elif skill.index(profile_selection_block) > skill.index('python3 "$scanner"'):
+        errors.append("profile selection must precede scanner invocation")
+    profile_assignment_lines = [
+        line.strip()
+        for line in skill.splitlines()
+        if re.match(
+            r"^[ \t]*(?:(?:declare|export|readonly|typeset)[ \t]+)?profile=",
+            line,
+        )
+    ]
+    if profile_assignment_lines != [profile_selection_block.splitlines()[0]]:
+        errors.append("profile must be readonly and assigned exactly once")
+    if skill.count('--profile "$profile"') != 2:
+        errors.append("validated profile must be passed to both scanner invocations")
+    if re.search(r"--profile\s+(?:community|locked-down)(?:\s|$)", skill):
+        errors.append("scanner profile must not be hardcoded")
 
     if 'gh pr list --head "$branch" --state open' not in skill:
         errors.append("existing PR discovery contract is missing")
@@ -486,7 +520,7 @@ def validate_public_content(repo: Path, errors: list[str]) -> None:
         + 'rer\\s+[A-Za-z0-9._~+/-]{20,}))"',
         'LOCAL_HOST_RE = re.compile(r"(?i)\\b(?:local'
         + 'host|[a-z0-9.-]+\\.(?:local|internal))\\b")',
-        '    r"(?i)(?:file:'
+        '    r"(?:(?i:file):'
         + chr(47) * 3
         + '(?:[^\\s'
         + chr(47)

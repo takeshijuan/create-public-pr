@@ -39,7 +39,7 @@ Read [privacy-policy.md](references/privacy-policy.md) before resolving findings
 
 ## Complete adaptable command sequence
 
-Replace the angle-bracket path lists with the confirmed repository-relative paths and replace `short-description` with the focused branch slug. Keep proposal files under `.git/` so they cannot be committed accidentally.
+Replace the angle-bracket path lists with the confirmed repository-relative paths and replace `short-description` with the focused branch slug. Before running the sequence, set `CREATE_PUBLIC_PR_PROFILE` to the profile selected in step 4. Keep proposal files under `.git/` so they cannot be committed accidentally.
 
 ```bash
 repo_root=$(git rev-parse --show-toplevel) || exit 2
@@ -68,7 +68,11 @@ if test "$branch" = "$base"; then
 fi
 test "$branch" != "$base" || exit 2
 
-profile=community
+readonly profile=${CREATE_PUBLIC_PR_PROFILE:?select community or locked-down from repository instructions}
+case "$profile" in
+  community|locked-down) ;;
+  *) exit 2 ;;
+esac
 skill_root=${CREATE_PUBLIC_PR_SKILL_DIR:?set to the directory containing the loaded SKILL.md}
 scanner="$skill_root/scripts/audit_public_pr.py"
 comparator="$skill_root/scripts/validate_audit_review.py"

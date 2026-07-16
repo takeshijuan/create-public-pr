@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -43,18 +44,26 @@ IPV6_RE = re.compile(
     r"[0-9A-Fa-f]{0,4}\]?)(?![0-9A-Fa-f:])"
 )
 LOCAL_PATH_RE = re.compile(
-    r"(?i)(?:file:///(?:[^\s/]+/)+[^\s/]+|"
-    r"(?<![A-Z0-9_.~:/\\-])/(?:Users|home|root|tmp|private|var|etc|opt|usr|"
-    r"bin|sbin|Applications|data|workspace|workspaces|Library|Volumes|mnt|srv)"
+    r"(?:(?i:file):///(?:[^\s/]+/)+[^\s/]+|"
+    r"(?<![A-Za-z0-9_.~:/\\-])/(?:Users|(?i:home|root|tmp|private|var|etc|"
+    r"opt|usr|bin|sbin|applications|data|workspace|workspaces|library|"
+    r"volumes|mnt|srv))"
     r"/(?:[^\s/]+/)*[^\s/]+|"
-    r"(?<![A-Z0-9])[A-Z]:[\\/](?:[^\s\\/]+[\\/])*[^\s\\/]+|"
+    r"(?<![A-Za-z0-9])[A-Za-z]:[\\/](?:[^\s\\/]+[\\/])*[^\s\\/]+|"
     r"(?<!\\)\\\\[^\s\\]+\\[^\s\\]+(?:\\[^\s\\]+)+|"
-    r"(?<![A-Z0-9_.-])~/[^\s]+)"
+    r"(?<![A-Za-z0-9_.-])~/[^\s]+)"
 )
 SAFE_SHEBANG_RE = re.compile(
-    r"^#!(?:/" + r"usr/bin/env(?:\s+-S)?\s+[A-Za-z0-9_.+-]+(?:\s+[^\s]+)*|"
-    r"/(?:usr/)?bin/(?:bash|dash|ksh|node|perl|python[0-9.]*|ruby|sh|zsh))$"
+    r"/(?:usr/)?bin/(?:bash|dash|ksh|node|perl|python[0-9.]*|ruby|sh|zsh)"
 )
+SAFE_ENV_INTERPRETER_RE = re.compile(
+    r"(?:bash|dash|ksh|node|perl|python[0-9.]*|ruby|sh|zsh)"
+)
+SAFE_ENV_PREFIX_OPTIONS = frozenset(
+    {"-0", "--debug", "-i", "--ignore-environment", "--null", "-v"}
+)
+SAFE_ENV_SHORT_PREFIX_RE = re.compile(r"-[0iv]+")
+SAFE_ENV_SPLIT_PREFIX_RE = re.compile(r"-[0iv]*S")
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b")
 TRACKER_RE = re.compile(
     r"\b([A-Z][A-Z0" + r"-9]{1,9})" + r"-[1-9]\d*\b"
@@ -196,6 +205,41 @@ def severity_for(category: str, profile: str) -> str:
     return "blocking"
 
 
+def safe_shebang(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped.startswith("#!"):
+        return False
+    try:
+        command = shlex.split(stripped[2:], posix=True)
+    except ValueError:
+        return False
+    if not command:
+        return False
+    executable, *arguments = command
+    if executable == "/usr/bin/env":
+        while arguments:
+            option = arguments[0]
+            if (
+                option in SAFE_ENV_PREFIX_OPTIONS
+                or SAFE_ENV_SHORT_PREFIX_RE.fullmatch(option) is not None
+            ):
+                arguments = arguments[1:]
+                continue
+            if SAFE_ENV_SPLIT_PREFIX_RE.fullmatch(option) is not None:
+                arguments = arguments[1:]
+            break
+        if arguments and arguments[0] == "--":
+            arguments = arguments[1:]
+        if not arguments:
+            return False
+        interpreter, *arguments = arguments
+        if SAFE_ENV_INTERPRETER_RE.fullmatch(interpreter) is None:
+            return False
+    elif SAFE_SHEBANG_RE.fullmatch(executable) is None:
+        return False
+    return LOCAL_PATH_RE.search(" ".join(arguments)) is None
+
+
 def make_finding(
     category: str,
     profile: str,
@@ -253,7 +297,7 @@ def scan_text(
             continue
         if address.is_private or address.is_loopback or address.is_link_local:
             categories.add("private-host")
-    if not SAFE_SHEBANG_RE.fullmatch(text.strip()) and LOCAL_PATH_RE.search(text):
+    if not safe_shebang(text) and LOCAL_PATH_RE.search(text):
         categories.add("local-path")
     for match in EMAIL_RE.finditer(text):
         address = match.group(0).lower()
@@ -487,7 +531,9 @@ def artifact_id_for_blob(
     if expected is None:
         return None
     digest = hashlib.sha256(blob).hexdigest()
-    return digest if digest == expected else None
+    if digest != expected:
+        raise AuditError
+    return digest
 
 
 def scan_commits(

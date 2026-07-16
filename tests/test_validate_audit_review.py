@@ -171,9 +171,7 @@ class AuditReviewComparatorTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_exact_public_artifact_review_passes_in_locked_down_profile(
-        self,
-    ) -> None:
+    def test_exact_public_artifact_review_passes_in_both_profiles(self) -> None:
         finding = {
             "category": "public-artifact",
             "severity": "review",
@@ -182,8 +180,6 @@ class AuditReviewComparatorTests(unittest.TestCase):
             "path_id": "abcdef012345",
             "artifact_id": "1" * 64,
         }
-        audit = self.audit_payload([finding])
-        audit["profile"] = "locked-down"
         record = self.review_record(
             category="public-artifact",
             path_id="abcdef012345",
@@ -198,9 +194,15 @@ class AuditReviewComparatorTests(unittest.TestCase):
             rationale="Checksum pinned public fixture with verified license.",
         )
 
-        result = self.run_comparator(audit, [record])
+        for profile in ("community", "locked-down"):
+            with self.subTest(profile=profile):
+                audit = self.audit_payload([finding])
+                audit["profile"] = profile
+                result = self.run_comparator(audit, [record])
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
 
     def test_public_artifact_review_digest_must_match_exactly(self) -> None:
         finding = {
@@ -231,17 +233,42 @@ class AuditReviewComparatorTests(unittest.TestCase):
         self.assertIn("review records do not exactly match findings", result.stdout)
 
     def test_public_artifact_finding_requires_path_and_digest(self) -> None:
-        finding = {
+        valid_finding = {
             "category": "public-artifact",
             "severity": "review",
             "source": "committed-content",
             "commit": "0123456789ab",
+            "path_id": "abcdef012345",
+            "artifact_id": "1" * 64,
         }
 
-        result = self.run_comparator(self.audit_payload([finding]), [])
+        cases = {
+            "missing_path_id": {
+                key: value
+                for key, value in valid_finding.items()
+                if key != "path_id"
+            },
+            "missing_artifact_id": {
+                key: value
+                for key, value in valid_finding.items()
+                if key != "artifact_id"
+            },
+            "malformed_artifact_id": {
+                **valid_finding,
+                "artifact_id": "not-a-digest",
+            },
+            "non_string_artifact_id": {
+                **valid_finding,
+                "artifact_id": 17,
+            },
+        }
 
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("audit finding schema is invalid", result.stdout)
+        for case, finding in cases.items():
+            with self.subTest(case=case):
+                result = self.run_comparator(self.audit_payload([finding]), [])
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("audit finding schema is invalid", result.stdout)
 
     def test_blocking_finding_always_stops_without_echoing_payload(self) -> None:
         finding = {
