@@ -157,10 +157,92 @@ class SkillRepositoryValidationTests(unittest.TestCase):
                 repo / "skills/create-public-pr/SKILL.md"
             ).read_text(encoding="utf-8").lower()
 
-            self.assertIn("ordinary oss publication", skill)
-            self.assertIn("no-external-links", skill)
-            self.assertIn("community", skill)
-            self.assertIn("locked-down", skill)
+            self.assertIn(
+                "use `community` for ordinary oss publication, including "
+                "repositories described only as future-public.",
+                skill,
+            )
+            self.assertIn(
+                "select `locked-down` only when repository instructions "
+                "explicitly impose no-external-links, no-internal-links, or an "
+                "equivalent prohibition.",
+                skill,
+            )
+
+    def test_profile_routing_requires_executable_validated_selection(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/SKILL.md",
+                "readonly profile=${CREATE_PUBLIC_PR_PROFILE:?select community or "
+                "locked-down from repository instructions}",
+                "profile=community",
+            )
+
+            self.assert_invalid(
+                repo, "executable profile selection contract is missing"
+            )
+
+    def test_selected_profile_is_passed_to_both_scanner_invocations(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/SKILL.md",
+                '--profile "$profile"',
+                "--profile community",
+            )
+
+            result = self.run_validator(repo)
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(
+                "validated profile must be passed to both scanner invocations",
+                result.stdout,
+            )
+            self.assertIn("scanner profile must not be hardcoded", result.stdout)
+            self.assertEqual(result.stderr, "")
+
+    def test_profile_selection_precedes_scanner_invocation(self) -> None:
+        with self.copied_repository() as repo:
+            skill_path = repo / "skills/create-public-pr/SKILL.md"
+            content = skill_path.read_text(encoding="utf-8")
+            selection_block = "\n".join(
+                (
+                    "readonly profile=${CREATE_PUBLIC_PR_PROFILE:?select community "
+                    "or locked-down from repository instructions}",
+                    'case "$profile" in',
+                    "  community|locked-down) ;;",
+                    "  *) exit 2 ;;",
+                    "esac",
+                )
+            )
+            self.assertIn(selection_block, content)
+            content = content.replace(selection_block + "\n", "", 1)
+            first_audit_end = '--format json > "$audit_file"\n'
+            self.assertIn(first_audit_end, content)
+            content = content.replace(
+                first_audit_end,
+                first_audit_end + selection_block + "\n",
+                1,
+            )
+            skill_path.write_text(content, encoding="utf-8")
+
+            self.assert_invalid(
+                repo, "profile selection must precede scanner invocation"
+            )
+
+    def test_profile_cannot_be_reassigned_after_validation(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/SKILL.md",
+                "esac\nskill_root=",
+                "esac\nprofile=community\nskill_root=",
+            )
+
+            self.assert_invalid(
+                repo, "profile must be readonly and assigned exactly once"
+            )
 
     def test_ci_pins_repository_discovery(self) -> None:
         with self.copied_repository() as repo:
@@ -303,7 +385,7 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             + 'rer\\s+[A-Za-z0-9._~+/-]{20,}))"',
             'LOCAL_HOST_RE = re.compile(r"(?i)\\b(?:local'
             + 'host|[a-z0-9.-]+\\.(?:local|internal))\\b")',
-            '    r"(?i)(?:file:'
+            '    r"(?:(?i:file):'
             + chr(47) * 3
             + '(?:[^\\s'
             + chr(47)

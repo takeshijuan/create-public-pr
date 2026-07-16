@@ -1198,11 +1198,18 @@ def test_detects_general_unix_and_windows_absolute_paths(
         "https://" + "example.com/etc/ssh/config",
         "ordinary slash/containing prose",
         "#!" + "/" + "usr/bin/env bash",
+        "#!" + "/" + "usr/bin/env -S python -O",
+        "#!" + "/" + "usr/bin/env -i -S python -O",
+        "#!" + "/" + "usr/bin/env -iS python -O",
+        "#!" + "/" + "usr/bin/env -ivS python -O",
+        "#!" + "/" + "usr/bin/env --ignore-environment -- python -I",
         "#!" + "/" + "bin/sh",
         "#!" + "/" + "usr/bin/python3",
+        "#!" + "/" + "usr/bin/python3 -I",
         "redirect output to /dev/null",
         "/api/v1/public/resource",
         "/public/v1/resource",
+        "/" + "users/123/profile",
     ],
 )
 def test_does_not_treat_relative_prose_or_urls_as_local_paths(
@@ -1217,6 +1224,40 @@ def test_does_not_treat_relative_prose_or_urls_as_local_paths(
 
     assert result.returncode == 0
     assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "shebang",
+    [
+        "#!" + "/" + "usr/bin/env -S python /" + "home/private-user/script.py",
+        "#!" + "/" + "usr/bin/env -iS python /" + "home/private-user/script.py",
+        "#!" + "/" + "usr/bin/env python --config=/" + "Users/private-user/config",
+        "#!" + "/" + "usr/bin/python3 /" + "tmp/private-script.py",
+        (
+            "#!"
+            + "/"
+            + "usr/bin/env -S python --config='/"
+            + "Users/private user/config'"
+        ),
+        "#!" + "/" + "usr/bin/python3 '/" + "tmp/private script.py'",
+    ],
+)
+def test_shebang_arguments_cannot_hide_local_paths(
+    tmp_path: Path, shebang: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    (repo / "change.txt").write_text(shebang + "\n", encoding="utf-8")
+    git(repo, "add", "change.txt")
+    git(repo, "commit", "-m", "add unsafe shebang")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    assert any(
+        finding["category"] == "local-path"
+        for finding in json.loads(result.stdout)["findings"]
+    )
+    assert shebang not in result.stdout + result.stderr
 
 
 def test_does_not_treat_unity_tilde_directory_as_local_path(
@@ -1354,7 +1395,9 @@ def test_hash_pinned_public_artifact_is_reviewable(
     assert findings[0]["severity"] == "review"
     assert findings[0]["source"] == "worktree-content"
     assert findings[0].get("path_id")
-    assert len(findings[0].get("artifact_id", "")) == 64
+    assert findings[0]["artifact_id"] == hashlib.sha256(
+        fixture.read_bytes()
+    ).hexdigest()
 
 
 def test_hash_pinned_committed_public_artifact_is_reviewable(
@@ -1388,7 +1431,9 @@ def test_hash_pinned_committed_public_artifact_is_reviewable(
     assert findings[0]["source"] == "committed-content"
     assert findings[0].get("commit")
     assert findings[0].get("path_id")
-    assert len(findings[0].get("artifact_id", "")) == 64
+    assert findings[0]["artifact_id"] == hashlib.sha256(
+        fixture.read_bytes()
+    ).hexdigest()
 
 
 def test_public_artifact_manifest_cannot_approve_private_key(tmp_path: Path) -> None:
@@ -1502,13 +1547,52 @@ def test_manifest_does_not_approve_different_intermediate_commit_bytes(
         str(manifest),
     )
 
-    assert result.returncode == 1
-    assert any(
-        finding["category"] == "credential"
-        and finding["source"] == "committed-content"
-        for finding in json.loads(result.stdout)["findings"]
-    )
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
     assert secret not in result.stdout + result.stderr
+
+
+def test_manifest_digest_drift_in_staged_blob_is_incomplete(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    fixture = repo / "tests" / "fixtures" / "public-fixture.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    git(repo, "commit", "-m", "add public fixture")
+    manifest = write_public_artifact_manifest(
+        repo, "tests/fixtures/public-fixture.txt"
+    )
+    fixture.write_text("staged drift\n", encoding="utf-8")
+    git(repo, "add", "tests/fixtures/public-fixture.txt")
+    fixture.write_text("reviewed public fixture\n", encoding="utf-8")
+    manifest_digest = manifest.read_text(encoding="utf-8").split()[0]
+    staged_blob = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "show",
+            ":tests/fixtures/public-fixture.txt",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(fixture.read_bytes()).hexdigest() == manifest_digest
+    assert hashlib.sha256(staged_blob).hexdigest() != manifest_digest
+
+    result = audit(
+        repo,
+        "HEAD",
+        "--public-artifacts-from",
+        str(manifest),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["findings"] == []
 
 
 @pytest.mark.parametrize(
