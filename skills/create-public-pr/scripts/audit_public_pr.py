@@ -61,6 +61,8 @@ TRACKER_RE = re.compile(
 )
 PUBLIC_IDENTIFIER_NUMBERS = {
     "AES": frozenset({128, 192, 256}),
+    "CAIP": frozenset({2}),
+    "EIP": frozenset({1559}),
     "FIPS": frozenset({140, 180, 186, 197, 198, 202, 203, 204, 205, 206}),
     "LICENSE": frozenset({2}),
     "NIST": frozenset({800}),
@@ -68,6 +70,7 @@ PUBLIC_IDENTIFIER_NUMBERS = {
     "SEC": frozenset({1, 2}),
     "SHA": frozenset({1, 224, 256, 384, 512}),
     "SLSA": frozenset({1, 2, 3, 4}),
+    "UTF": frozenset({8, 16, 32}),
     "X9": frozenset({62}),
 }
 PUBLIC_ARTIFACT_CATEGORIES = frozenset({"credential", "private-host"})
