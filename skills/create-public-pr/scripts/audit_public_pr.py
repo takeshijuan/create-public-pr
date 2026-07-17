@@ -237,9 +237,218 @@ def valid_workflow_stop_token(token: str) -> bool:
     )
 
 
+def shell_assignment_value_start(text: str, start: int) -> int | None:
+    cursor = start
+    if (
+        cursor >= len(text)
+        or not (text[cursor].isalpha() or text[cursor] == "_")
+    ):
+        return None
+    cursor += 1
+    while (
+        cursor < len(text)
+        and (text[cursor].isalnum() or text[cursor] == "_")
+    ):
+        cursor += 1
+    if cursor < len(text) and text[cursor] == "[":
+        bracket_depth = 1
+        quote: str | None = None
+        cursor += 1
+        while cursor < len(text) and bracket_depth:
+            character = text[cursor]
+            if quote == "'":
+                if character == "'":
+                    quote = None
+                cursor += 1
+                continue
+            if character == "\\":
+                cursor = min(cursor + 2, len(text))
+                continue
+            if quote == '"':
+                if character == '"':
+                    quote = None
+                cursor += 1
+                continue
+            if character in {'"', "'"}:
+                quote = character
+            elif character == "[":
+                bracket_depth += 1
+            elif character == "]":
+                bracket_depth -= 1
+            elif character in "\r\n":
+                return None
+            cursor += 1
+        if bracket_depth:
+            return None
+    if cursor < len(text) and text[cursor] == "+":
+        cursor += 1
+    return cursor + 1 if cursor < len(text) and text[cursor] == "=" else None
+
+
+def shell_word_end(
+    text: str,
+    start: int,
+    captured_spans: list[tuple[int, int]] | None = None,
+) -> int:
+    context_kinds = ["word"]
+    context_starts: list[int | None] = [None]
+    quote_states: list[str | None] = [None]
+    cursor = start
+    if cursor < len(text) and text[cursor] == "(":
+        context_kinds.append("paren")
+        context_starts.append(None)
+        quote_states.append(None)
+        cursor += 1
+    while cursor < len(text):
+        character = text[cursor]
+        quote = quote_states[-1]
+        if quote == "'":
+            if character == "'":
+                quote_states[-1] = None
+            cursor += 1
+            continue
+        if character == "\\":
+            cursor = min(cursor + 2, len(text))
+            continue
+        if quote == '"':
+            if character == '"':
+                quote_states[-1] = None
+                cursor += 1
+                continue
+        elif character in {'"', "'"}:
+            quote_states[-1] = character
+            cursor += 1
+            continue
+        if character == "`":
+            if context_kinds[-1] == "backtick":
+                capture_start = context_starts.pop()
+                context_kinds.pop()
+                quote_states.pop()
+                if captured_spans is not None and capture_start is not None:
+                    captured_spans.append((capture_start, cursor + 1))
+            else:
+                context_kinds.append("backtick")
+                context_starts.append(cursor)
+                quote_states.append(None)
+            cursor += 1
+            continue
+        if text.startswith(("$(", "<(", ">("), cursor):
+            context_kinds.append("substitution")
+            context_starts.append(cursor)
+            quote_states.append(None)
+            cursor += 2
+            continue
+        if text.startswith("${", cursor):
+            context_kinds.append("brace")
+            context_starts.append(None)
+            quote_states.append(None)
+            cursor += 2
+            continue
+        if quote == '"':
+            cursor += 1
+            continue
+        context = context_kinds[-1]
+        if context in {"paren", "substitution"}:
+            if character == "(":
+                context_kinds.append("paren")
+                context_starts.append(None)
+                quote_states.append(None)
+            elif character == ")":
+                capture_start = context_starts.pop()
+                context_kinds.pop()
+                quote_states.pop()
+                if (
+                    context == "substitution"
+                    and captured_spans is not None
+                    and capture_start is not None
+                ):
+                    captured_spans.append((capture_start, cursor + 1))
+            cursor += 1
+            continue
+        if context == "brace":
+            if character == "{":
+                context_kinds.append("brace")
+                context_starts.append(None)
+                quote_states.append(None)
+            elif character == "}":
+                context_starts.pop()
+                context_kinds.pop()
+                quote_states.pop()
+            cursor += 1
+            continue
+        if context == "backtick":
+            cursor += 1
+            continue
+        if character in " \t\r\n;&|()<>":
+            break
+        cursor += 1
+    if captured_spans is not None:
+        for context, capture_start in zip(context_kinds, context_starts):
+            if context in {"backtick", "substitution"} and capture_start is not None:
+                captured_spans.append((capture_start, cursor))
+    return cursor
+
+
+def merge_spans(
+    spans: list[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def shell_value_spans(
+    text: str,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+    assignment_spans: list[tuple[int, int]] = []
+    captured_spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        if text.startswith(("<(", ">("), cursor):
+            word_end = shell_word_end(text, cursor, captured_spans)
+            cursor = max(word_end, cursor + 2)
+            continue
+        if text[cursor] in " \t\r\n;&|()<>":
+            cursor += 1
+            continue
+        value_start = shell_assignment_value_start(text, cursor)
+        if value_start is not None:
+            word_end = shell_word_end(text, value_start, captured_spans)
+            assignment_spans.append((value_start, word_end))
+            cursor = max(word_end, value_start)
+            continue
+        word_end = shell_word_end(text, cursor, captured_spans)
+        cursor = max(word_end, cursor + 1)
+    return tuple(assignment_spans), merge_spans(captured_spans)
+
+
+def position_in_spans(
+    position: int,
+    spans: tuple[tuple[int, int], ...],
+    starts: list[int],
+) -> bool:
+    span_index = bisect_right(starts, position) - 1
+    return bool(
+        span_index >= 0
+        and spans[span_index][0] <= position < spans[span_index][1]
+    )
+
+
 def workflow_output_segment_ends(
     text: str,
     stops: tuple[tuple[str, tuple[int, int]], ...],
+    shell_spans: (
+        tuple[
+            tuple[tuple[int, int], ...],
+            tuple[tuple[int, int], ...],
+        ]
+        | None
+    ) = None,
 ) -> tuple[int, ...]:
     segment_boundaries: list[int] = []
     quoted_segments: list[tuple[int, int]] = []
@@ -323,6 +532,15 @@ def workflow_output_segment_ends(
         printf_newlines_by_segment[quoted_segment] = tuple(
             newline_boundaries
         )
+    assignment_value_spans, captured_output_spans = (
+        shell_spans if shell_spans is not None else shell_value_spans(text)
+    )
+    assignment_value_starts = [
+        start for start, _ in assignment_value_spans
+    ]
+    captured_output_starts = [
+        start for start, _ in captured_output_spans
+    ]
 
     segment_ends: list[int] = []
     quote_index = 0
@@ -353,6 +571,18 @@ def workflow_output_segment_ends(
                     and quoted_segments[candidate_quote_index][0]
                     <= candidate.start()
                     < quoted_segments[candidate_quote_index][1]
+                ):
+                    continue
+                if position_in_spans(
+                    candidate.start(),
+                    assignment_value_spans,
+                    assignment_value_starts,
+                ):
+                    continue
+                if position_in_spans(
+                    candidate.start(),
+                    captured_output_spans,
+                    captured_output_starts,
                 ):
                     continue
                 command_match = candidate
@@ -428,9 +658,28 @@ def workflow_output_segment_ends(
 def paired_workflow_resume_markers(
     text: str,
 ) -> tuple[tuple[str, tuple[int, int]], ...]:
-    raw_stops = workflow_stop_commands(text)
-    markers = workflow_markers(text)
-    stop_segment_ends = workflow_output_segment_ends(text, raw_stops)
+    shell_spans = shell_value_spans(text)
+    nonemitting_spans = merge_spans(
+        list(shell_spans[0]) + list(shell_spans[1])
+    )
+    nonemitting_starts = [start for start, _ in nonemitting_spans]
+    raw_stops = tuple(
+        stop
+        for stop in workflow_stop_commands(text)
+        if not position_in_spans(
+            stop[1][0], nonemitting_spans, nonemitting_starts
+        )
+    )
+    markers = tuple(
+        marker
+        for marker in workflow_markers(text)
+        if not position_in_spans(
+            marker[1][0], nonemitting_spans, nonemitting_starts
+        )
+    )
+    stop_segment_ends = workflow_output_segment_ends(
+        text, raw_stops, shell_spans
+    )
     stops = tuple(
         (
             token[:-2],
@@ -525,8 +774,25 @@ def workflow_resume_spans_by_line(
     line_starts.extend(
         match.end() for match in re.finditer("\n", text)
     )
+    paired_markers = paired_workflow_resume_markers(text)
+    paired_tokens = {token for token, _ in paired_markers}
+    shell_spans = shell_value_spans(text)
+    nonemitting_spans = merge_spans(
+        list(shell_spans[0]) + list(shell_spans[1])
+    )
+    nonemitting_starts = [start for start, _ in nonemitting_spans]
+    safe_markers = paired_markers + tuple(
+        marker
+        for marker in workflow_markers(text)
+        if (
+            marker[0] in paired_tokens
+            and position_in_spans(
+                marker[1][0], nonemitting_spans, nonemitting_starts
+            )
+        )
+    )
     spans_by_line: dict[int, list[tuple[int, int]]] = {}
-    for _, (start, end) in paired_workflow_resume_markers(text):
+    for _, (start, end) in safe_markers:
         line_index = bisect_right(line_starts, start) - 1
         line_start = line_starts[line_index]
         spans_by_line.setdefault(line_index + 1, []).append(
@@ -729,6 +995,7 @@ def scan_text(
     commit: str | None = None,
     path: str | None = None,
     known_workflow_resume_spans: tuple[tuple[int, int], ...] = (),
+    workflow_pairing_authoritative: bool = False,
 ) -> list[Finding]:
     categories: set[str] = set()
     if PRIVATE_KEY_RE.search(text):
@@ -758,7 +1025,13 @@ def scan_text(
         if not workflow_token_contains_private_ipv6(token)
     )
     workflow_resume_spans = (
-        tuple(span for _, span in paired_workflow_resume_markers(text))
+        (
+            ()
+            if workflow_pairing_authoritative
+            else tuple(
+                span for _, span in paired_workflow_resume_markers(text)
+            )
+        )
         + known_workflow_resume_spans
     )
     workflow_unpaired_resume_spans = tuple(
@@ -878,6 +1151,7 @@ def scan_content_text(
     path: str,
     artifact_id: str | None = None,
     known_workflow_resume_spans: tuple[tuple[int, int], ...] = (),
+    workflow_pairing_authoritative: bool = False,
 ) -> list[Finding]:
     findings = scan_text(
         text,
@@ -887,6 +1161,7 @@ def scan_content_text(
         commit=commit,
         path=path,
         known_workflow_resume_spans=known_workflow_resume_spans,
+        workflow_pairing_authoritative=workflow_pairing_authoritative,
     )
     if artifact_id is None or CREDENTIAL_TOKEN_RE.search(text):
         return findings
@@ -1241,6 +1516,7 @@ def scan_commits(
                                         line_number, ()
                                     )
                                 ),
+                                workflow_pairing_authoritative=True,
                             )
                         )
             message = git(repo, "show", "-s", "--format=%B", commit).stdout
@@ -1438,6 +1714,7 @@ def scan_worktree(
                     content_workflow_resume_spans: dict[
                         int, tuple[tuple[int, int], ...]
                     ] = {}
+                    workflow_pairing_authoritative = False
                     if source == "staged-content" and diff:
                         index_entry = git_bytes(
                             repo, "ls-files", "--stage", "-z", "--", path
@@ -1488,6 +1765,7 @@ def scan_worktree(
                                         index_blob.decode("utf-8", "replace")
                                     )
                                 )
+                                workflow_pairing_authoritative = True
                     elif source == "worktree-content" and current_content is not None:
                         artifact_id = artifact_id_for_blob(
                             path, current_content, public_artifacts
@@ -1498,6 +1776,7 @@ def scan_worktree(
                                     current_content.decode("utf-8", "replace")
                                 )
                             )
+                            workflow_pairing_authoritative = True
                     for line_number, line in added_lines_with_numbers(diff):
                         findings.extend(
                             scan_content_text(
@@ -1511,6 +1790,9 @@ def scan_worktree(
                                     content_workflow_resume_spans.get(
                                         line_number, ()
                                     )
+                                ),
+                                workflow_pairing_authoritative=(
+                                    workflow_pairing_authoritative
                                 ),
                             )
                         )
@@ -1575,6 +1857,7 @@ def scan_worktree(
                         known_workflow_resume_spans=(
                             content_workflow_resume_spans.get(line_number, ())
                         ),
+                        workflow_pairing_authoritative=True,
                     )
                 )
         return findings

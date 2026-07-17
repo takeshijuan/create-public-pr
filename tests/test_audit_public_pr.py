@@ -838,6 +838,178 @@ def test_printf_format_follows_command_not_environment_assignment(
     assert any(finding["category"] == "private-host" for finding in findings)
 
 
+def test_output_command_name_in_assignment_value_is_skipped(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        "MODE=print "
+        + f"printf '%s\\n' '{stop_command}' '{resume_marker}'\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit assigned command-like value")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_output_command_in_assignment_substitution_is_skipped(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        "MODE=$(printf ignored) "
+        + f"printf '%s\\n' '{stop_command}' '{resume_marker}'\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: ignore captured output command")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "workflow_template",
+    [
+        "MODE=$(printf '%s\\n' '{stop}' '{resume}')\n",
+        "MODE=(printf '%s\\n' '{stop}' '{resume}')\n",
+        "MODE[0]=printf '%s\\n' '{stop}' '{resume}'\n",
+        "MODE[\"]\"]=printf '%s\\n' '{stop}' '{resume}'\n",
+        "MODE[\\]]=printf '%s\\n' '{stop}' '{resume}'\n",
+        "MODE=$(true)printf '%s\\n' '{stop}' '{resume}'\n",
+        "MODE=<(printf '%s\\n' '{stop}' '{resume}')\n",
+        "MODE=\\\nprintf '%s\\n' '{stop}' '{resume}'\n",
+    ],
+)
+def test_assignment_only_output_command_does_not_mask_markers(
+    tmp_path: Path,
+    workflow_template: str,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        workflow_template.format(stop=stop_command, resume=resume_marker),
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: capture assignment-only output")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "workflow_template",
+    [
+        "true $(printf '%s\\n' '{stop}' '{resume}')\n",
+        "$(MODE=printf '%s\\n' '{stop}' '{resume}')\n",
+        "true <(printf '%s\\n' '{stop}' '{resume}')\n",
+        "printf '%s\\n' safe $(true '{stop}' '{resume}')\n",
+        (
+            "printf '%s\\n' safe "
+            "$(MODE=printf '%s\\n' '{stop}' '{resume}')\n"
+        ),
+        (
+            "printf '%s\\n' safe "
+            "<(printf '%s\\n' '{stop}' '{resume}')\n"
+        ),
+        (
+            "printf '%s\\n' '{stop}'; "
+            "true $(printf '%s\\n' '{resume}')\n"
+        ),
+    ],
+)
+def test_captured_output_command_does_not_mask_markers(
+    tmp_path: Path,
+    workflow_template: str,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        workflow_template.format(stop=stop_command, resume=resume_marker),
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: capture nested output")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_captured_resume_does_not_consume_real_resume(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        f"printf '%s\\n' '{stop_command}'\n"
+        + f"true $(printf '%s\\n' '{resume_marker}')\n"
+        + f"printf '%s\\n' '{resume_marker}'\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: ignore captured resume marker")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_assignment_command_lookup_remains_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    assignment_value = "/".join(["print"] * 50_000)
+    text = (
+        "MODE="
+        + assignment_value
+        + f" printf '%s\\n' '{stop_command}' '{resume_marker}'"
+    )
+
+    started_at = time.perf_counter()
+    paired_markers = module["paired_workflow_resume_markers"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert len(paired_markers) == 1
+
+
 def test_printf_adjacent_shell_fragments_are_one_argument(
     tmp_path: Path,
 ) -> None:
