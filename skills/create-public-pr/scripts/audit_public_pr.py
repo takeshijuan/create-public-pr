@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import subprocess
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -63,6 +64,12 @@ WORKFLOW_STOP_COMMAND_PREFIX_RE = re.compile(
 )
 WORKFLOW_UNPAIRED_RESUME_TOKEN_RE = re.compile(
     r":" r":" r"[G-Zg-z_$-][A-Za-z0-9_${}-]*" r":" r":",
+)
+OUTPUT_COMMAND_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:echo|print|printf)(?![A-Za-z0-9_])"
+)
+HUNK_HEADER_RE = re.compile(
+    rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@"
 )
 LOCAL_PATH_RE = re.compile(
     r"(?:(?i:file):///(?:[^\s/]+/)+[^\s/]+|"
@@ -223,20 +230,312 @@ def workflow_markers(text: str) -> tuple[tuple[str, tuple[int, int]], ...]:
     return tuple(markers)
 
 
-def extract_workflow_stop_tokens(text: str) -> frozenset[str]:
-    first_stop_by_token: dict[str, int] = {}
-    for token, (start, _) in workflow_stop_commands(text):
-        first_stop_by_token.setdefault(token, start)
-    first_marker_by_token: dict[str, int] = {}
-    for token, (start, _) in workflow_markers(text):
-        first_marker_by_token.setdefault(token, start)
-    return frozenset(
-        token
-        for token, stop_position in first_stop_by_token.items()
-        if stop_position < first_marker_by_token.get(token, -1)
-        and not private_ipv6_candidate(":" + ":" + token + ":" + ":")
+def valid_workflow_stop_token(token: str) -> bool:
+    return (
+        not private_ipv6_candidate(":" + ":" + token + ":" + ":")
         and not workflow_token_contains_private_ipv6(token)
     )
+
+
+def workflow_output_segment_ends(
+    text: str,
+    stops: tuple[tuple[str, tuple[int, int]], ...],
+) -> tuple[int, ...]:
+    segment_boundaries: list[int] = []
+    quoted_segments: list[tuple[int, int]] = []
+    quote: str | None = None
+    quote_start = 0
+    cursor = 0
+    while cursor < len(text):
+        character = text[cursor]
+        if quote is None:
+            if text.startswith("${{", cursor):
+                expression_end, failure_end = parse_workflow_expression(
+                    text, cursor
+                )
+                cursor = (
+                    expression_end
+                    if expression_end is not None
+                    else failure_end
+                )
+                continue
+            if character in {'"', "'"}:
+                quote = character
+                quote_start = cursor + 1
+                cursor += 1
+                continue
+            if character == "\\" and cursor + 1 < len(text):
+                cursor += 2
+                continue
+            if character in {"\r", "\n", ";"}:
+                segment_boundaries.append(cursor)
+                cursor += 1
+                continue
+            if text.startswith(("&&", "||"), cursor):
+                segment_boundaries.append(cursor)
+                cursor += 2
+                continue
+            cursor += 1
+            continue
+        if quote == '"' and character == "\\" and cursor + 1 < len(text):
+            cursor += 2
+            continue
+        if quote == "'" and character == "'" and text.startswith("''", cursor):
+            cursor += 2
+            continue
+        if character == "\n":
+            quote = None
+            segment_boundaries.append(cursor)
+            cursor += 1
+            continue
+        if character == "\r":
+            quote = None
+            segment_boundaries.append(cursor)
+            cursor += 1
+            continue
+        if character == quote:
+            quoted_segments.append((quote_start, cursor))
+            quote = None
+        cursor += 1
+    segment_boundaries.append(len(text))
+    quoted_segment_starts = [
+        start for start, _ in quoted_segments
+    ]
+    printf_newlines_by_segment: dict[
+        tuple[int, int], tuple[int, ...]
+    ] = {}
+    for quoted_segment in quoted_segments:
+        segment_start, segment_end = quoted_segment
+        newline_boundaries: list[int] = []
+        segment_cursor = segment_start
+        while segment_cursor < segment_end:
+            escape = text.find("\\n", segment_cursor, segment_end)
+            if escape == -1:
+                break
+            backslash_count = 1
+            before = escape - 1
+            while before >= segment_start and text[before] == "\\":
+                backslash_count += 1
+                before -= 1
+            if backslash_count % 2 == 1:
+                newline_boundaries.append(escape)
+            segment_cursor = escape + 2
+        printf_newlines_by_segment[quoted_segment] = tuple(
+            newline_boundaries
+        )
+
+    segment_ends: list[int] = []
+    quote_index = 0
+    cached_boundary_index = -1
+    command_end = 0
+    is_printf = False
+    printf_format_segment: tuple[int, int] | None = None
+    printf_repeats_single_argument = False
+    for _, (stop_start, _) in stops:
+        boundary_index = bisect_right(segment_boundaries, stop_start)
+        if boundary_index != cached_boundary_index:
+            cached_boundary_index = boundary_index
+            command_end = segment_boundaries[boundary_index]
+            command_start = (
+                segment_boundaries[boundary_index - 1] + 1
+                if boundary_index > 0
+                else 0
+            )
+            command_match: re.Match[str] | None = None
+            for candidate in OUTPUT_COMMAND_RE.finditer(
+                text, command_start, command_end
+            ):
+                candidate_quote_index = bisect_right(
+                    quoted_segment_starts, candidate.start()
+                ) - 1
+                if (
+                    candidate_quote_index >= 0
+                    and quoted_segments[candidate_quote_index][0]
+                    <= candidate.start()
+                    < quoted_segments[candidate_quote_index][1]
+                ):
+                    continue
+                command_match = candidate
+                break
+            is_printf = bool(
+                command_match is not None
+                and command_match.group(0) == "printf"
+            )
+            printf_format_segment = None
+            printf_repeats_single_argument = False
+            if is_printf and command_match is not None:
+                format_index = bisect_left(
+                    quoted_segment_starts, command_match.end()
+                )
+                if (
+                    format_index < len(quoted_segments)
+                    and quoted_segments[format_index][0] < command_end
+                ):
+                    candidate_format = quoted_segments[format_index]
+                    format_start, format_end = candidate_format
+                    format_prefix = text[
+                        command_match.end() : format_start - 1
+                    ]
+                    if re.fullmatch(
+                        r"\s*(?:--\s+)?", format_prefix
+                    ):
+                        printf_format_segment = candidate_format
+                        printf_repeats_single_argument = (
+                            text[format_start:format_end] == "%s\\n"
+                        )
+        while (
+            quote_index < len(quoted_segments)
+            and quoted_segments[quote_index][1] <= stop_start
+        ):
+            quote_index += 1
+        quoted_segment = (
+            quoted_segments[quote_index]
+            if (
+                quote_index < len(quoted_segments)
+                and quoted_segments[quote_index][0] <= stop_start
+                < quoted_segments[quote_index][1]
+            )
+            else None
+        )
+        if (
+            is_printf
+            and quoted_segment is not None
+            and quoted_segment == printf_format_segment
+        ):
+            newline_boundaries = printf_newlines_by_segment.get(
+                quoted_segment, ()
+            )
+            newline_index = bisect_left(newline_boundaries, stop_start)
+            segment_ends.append(
+                newline_boundaries[newline_index]
+                if newline_index < len(newline_boundaries)
+                else quoted_segment[1]
+            )
+        elif (
+            printf_repeats_single_argument
+            and quoted_segment is not None
+            and (
+                quoted_segment[1] + 1 >= command_end
+                or text[quoted_segment[1] + 1].isspace()
+            )
+        ):
+            segment_ends.append(quoted_segment[1])
+        else:
+            segment_ends.append(command_end)
+    return tuple(segment_ends)
+
+
+def paired_workflow_resume_markers(
+    text: str,
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    raw_stops = workflow_stop_commands(text)
+    markers = workflow_markers(text)
+    stop_segment_ends = workflow_output_segment_ends(text, raw_stops)
+    stops = tuple(
+        (
+            token[:-2],
+            (start, segment_end),
+        )
+        if (
+            token.endswith("\\n")
+            and end == segment_end + 2
+        )
+        else (token, (start, end))
+        for (token, (start, end)), segment_end in zip(
+            raw_stops, stop_segment_ends
+        )
+    )
+    active_token: str | None = None
+    paired_markers: list[tuple[str, tuple[int, int]]] = []
+    stop_index = 0
+    marker_index = 0
+
+    def skip_events_before(
+        end: int, current_stop: int, current_marker: int
+    ) -> tuple[int, int]:
+        while (
+            current_stop < len(stops)
+            and stops[current_stop][1][0] < end
+        ):
+            current_stop += 1
+        while (
+            current_marker < len(markers)
+            and markers[current_marker][1][0] < end
+        ):
+            current_marker += 1
+        return current_stop, current_marker
+
+    while stop_index < len(stops) or marker_index < len(markers):
+        stop_start = (
+            stops[stop_index][1][0]
+            if stop_index < len(stops)
+            else len(text) + 1
+        )
+        marker_start = (
+            markers[marker_index][1][0]
+            if marker_index < len(markers)
+            else len(text) + 1
+        )
+        if stop_start < marker_start or (
+            stop_start == marker_start and active_token is None
+        ):
+            stop_segment_end = stop_segment_ends[stop_index]
+            token, _ = stops[stop_index]
+            stop_index += 1
+            if active_token is not None:
+                stop_index, marker_index = skip_events_before(
+                    stop_segment_end, stop_index, marker_index
+                )
+                continue
+            if valid_workflow_stop_token(token):
+                active_token = token
+            stop_index, marker_index = skip_events_before(
+                stop_segment_end, stop_index, marker_index
+            )
+            continue
+        token, span = markers[marker_index]
+        if stop_start == marker_start:
+            stop_segment_end = stop_segment_ends[stop_index]
+            stop_index += 1
+            if token == active_token:
+                paired_markers.append((token, span))
+                active_token = None
+            marker_index += 1
+            stop_index, marker_index = skip_events_before(
+                stop_segment_end, stop_index, marker_index
+            )
+            continue
+        if token == active_token:
+            paired_markers.append((token, span))
+            active_token = None
+        marker_index += 1
+    return tuple(paired_markers)
+
+
+def extract_workflow_stop_tokens(text: str) -> frozenset[str]:
+    return frozenset(
+        token for token, _ in paired_workflow_resume_markers(text)
+    )
+
+
+def workflow_resume_spans_by_line(
+    text: str,
+) -> dict[int, tuple[tuple[int, int], ...]]:
+    line_starts = [0]
+    line_starts.extend(
+        match.end() for match in re.finditer("\n", text)
+    )
+    spans_by_line: dict[int, list[tuple[int, int]]] = {}
+    for _, (start, end) in paired_workflow_resume_markers(text):
+        line_index = bisect_right(line_starts, start) - 1
+        line_start = line_starts[line_index]
+        spans_by_line.setdefault(line_index + 1, []).append(
+            (start - line_start, end - line_start)
+        )
+    return {
+        line_number: tuple(spans)
+        for line_number, spans in spans_by_line.items()
+    }
 
 
 PUBLIC_ARTIFACT_CATEGORIES = frozenset({"credential", "private-host"})
@@ -429,7 +728,7 @@ def scan_text(
     repo_identity: tuple[str, str, str] | None,
     commit: str | None = None,
     path: str | None = None,
-    known_workflow_stop_tokens: frozenset[str] = frozenset(),
+    known_workflow_resume_spans: tuple[tuple[int, int], ...] = (),
 ) -> list[Finding]:
     categories: set[str] = set()
     if PRIVATE_KEY_RE.search(text):
@@ -458,10 +757,9 @@ def scan_text(
         for token, span in workflow_stop_matches
         if not workflow_token_contains_private_ipv6(token)
     )
-    stop_tokens = set(known_workflow_stop_tokens)
-    stop_tokens.update(extract_workflow_stop_tokens(text))
-    workflow_resume_spans = tuple(
-        span for token, span in workflow_markers(text) if token in stop_tokens
+    workflow_resume_spans = (
+        tuple(span for _, span in paired_workflow_resume_markers(text))
+        + known_workflow_resume_spans
     )
     workflow_unpaired_resume_spans = tuple(
         match.span()
@@ -579,7 +877,7 @@ def scan_content_text(
     commit: str | None = None,
     path: str,
     artifact_id: str | None = None,
-    known_workflow_stop_tokens: frozenset[str] = frozenset(),
+    known_workflow_resume_spans: tuple[tuple[int, int], ...] = (),
 ) -> list[Finding]:
     findings = scan_text(
         text,
@@ -588,7 +886,7 @@ def scan_content_text(
         repo_identity=repo_identity,
         commit=commit,
         path=path,
-        known_workflow_stop_tokens=known_workflow_stop_tokens,
+        known_workflow_resume_spans=known_workflow_resume_spans,
     )
     if artifact_id is None or CREDENTIAL_TOKEN_RE.search(text):
         return findings
@@ -612,24 +910,43 @@ def scan_content_text(
     return retained
 
 
-def added_lines(diff: bytes, prefix_width: int = 1) -> list[str]:
-    lines: list[str] = []
+def added_lines_with_numbers(
+    diff: bytes, prefix_width: int = 1
+) -> list[tuple[int, str]]:
+    lines: list[tuple[int, str]] = []
     in_hunk = False
+    new_line_number = 0
     addition_prefix = b"+" * prefix_width
-    for raw_line in diff.splitlines():
+    for raw_line in diff.split(b"\n"):
         if raw_line.startswith(b"diff --"):
             in_hunk = False
-        elif raw_line.startswith(b"@@"):
+        elif match := HUNK_HEADER_RE.match(raw_line):
             in_hunk = True
+            new_line_number = int(match.group(1))
         elif in_hunk and raw_line.startswith(addition_prefix):
-            lines.append(raw_line[prefix_width:].decode("utf-8", "replace"))
+            lines.append(
+                (
+                    new_line_number,
+                    raw_line[prefix_width:].decode("utf-8", "replace"),
+                )
+            )
+            new_line_number += 1
+        elif in_hunk and raw_line.startswith(b" "):
+            new_line_number += 1
     return lines
+
+
+def added_lines(diff: bytes, prefix_width: int = 1) -> list[str]:
+    return [
+        line
+        for _, line in added_lines_with_numbers(diff, prefix_width)
+    ]
 
 
 def merge_added_lines(
     repo: Path, parents: list[str], commit: str, path: str
-) -> list[str]:
-    additions: set[str] | None = None
+) -> list[tuple[int, str]]:
+    additions: set[tuple[int, str]] | None = None
     for parent in parents:
         diff = git_bytes(
             repo,
@@ -643,7 +960,7 @@ def merge_added_lines(
             "--",
             path,
         ).stdout
-        parent_additions = set(added_lines(diff))
+        parent_additions = set(added_lines_with_numbers(diff))
         additions = (
             parent_additions
             if additions is None
@@ -872,8 +1189,9 @@ def scan_commits(
                         )
                     )
                 else:
-                    content_workflow_stop_tokens = extract_workflow_stop_tokens(
-                        blob.decode("utf-8", "replace")
+                    content_text = blob.decode("utf-8", "replace")
+                    content_workflow_resume_spans = (
+                        workflow_resume_spans_by_line(content_text)
                     )
                     if len(parents) > 1:
                         content_lines = merge_added_lines(
@@ -892,7 +1210,7 @@ def scan_commits(
                             "--",
                             changed_path,
                         ).stdout
-                        content_lines = added_lines(diff)
+                        content_lines = added_lines_with_numbers(diff)
                     else:
                         diff = git_bytes(
                             repo,
@@ -907,8 +1225,8 @@ def scan_commits(
                             "--",
                             changed_path,
                         ).stdout
-                        content_lines = added_lines(diff)
-                    for line in content_lines:
+                        content_lines = added_lines_with_numbers(diff)
+                    for line_number, line in content_lines:
                         findings.extend(
                             scan_content_text(
                                 line,
@@ -918,7 +1236,11 @@ def scan_commits(
                                 commit=commit,
                                 path=changed_path,
                                 artifact_id=artifact_id,
-                                known_workflow_stop_tokens=content_workflow_stop_tokens,
+                                known_workflow_resume_spans=(
+                                    content_workflow_resume_spans.get(
+                                        line_number, ()
+                                    )
+                                ),
                             )
                         )
             message = git(repo, "show", "-s", "--format=%B", commit).stdout
@@ -1113,7 +1435,9 @@ def scan_worktree(
                 ):
                     diff = git_bytes(repo, *diff_args, "--", path).stdout
                     artifact_id = None
-                    content_workflow_stop_tokens: frozenset[str] = frozenset()
+                    content_workflow_resume_spans: dict[
+                        int, tuple[tuple[int, int], ...]
+                    ] = {}
                     if source == "staged-content" and diff:
                         index_entry = git_bytes(
                             repo, "ls-files", "--stage", "-z", "--", path
@@ -1159,8 +1483,8 @@ def scan_worktree(
                                     )
                                 )
                             else:
-                                content_workflow_stop_tokens = (
-                                    extract_workflow_stop_tokens(
+                                content_workflow_resume_spans = (
+                                    workflow_resume_spans_by_line(
                                         index_blob.decode("utf-8", "replace")
                                     )
                                 )
@@ -1169,10 +1493,12 @@ def scan_worktree(
                             path, current_content, public_artifacts
                         )
                         if b"\0" not in current_content[:8192]:
-                            content_workflow_stop_tokens = extract_workflow_stop_tokens(
-                                current_content.decode("utf-8", "replace")
+                            content_workflow_resume_spans = (
+                                workflow_resume_spans_by_line(
+                                    current_content.decode("utf-8", "replace")
+                                )
                             )
-                    for line in added_lines(diff):
+                    for line_number, line in added_lines_with_numbers(diff):
                         findings.extend(
                             scan_content_text(
                                 line,
@@ -1181,7 +1507,11 @@ def scan_worktree(
                                 repo_identity=repo_identity,
                                 path=path,
                                 artifact_id=artifact_id,
-                                known_workflow_stop_tokens=content_workflow_stop_tokens,
+                                known_workflow_resume_spans=(
+                                    content_workflow_resume_spans.get(
+                                        line_number, ()
+                                    )
+                                ),
                             )
                         )
             if link_component is not None:
@@ -1225,13 +1555,15 @@ def scan_worktree(
                 continue
             if untracked:
                 content = current_content.decode("utf-8", "replace")
-                lines = content.splitlines()
-                content_workflow_stop_tokens = extract_workflow_stop_tokens(content)
+                lines = list(enumerate(content.split("\n"), start=1))
+                content_workflow_resume_spans = workflow_resume_spans_by_line(
+                    content
+                )
             else:
                 lines = []
-                content_workflow_stop_tokens = frozenset()
+                content_workflow_resume_spans = {}
             artifact_id = artifact_id_for_blob(path, current_content, public_artifacts)
-            for line in lines:
+            for line_number, line in lines:
                 findings.extend(
                     scan_content_text(
                         line,
@@ -1240,7 +1572,9 @@ def scan_worktree(
                         repo_identity=repo_identity,
                         path=path,
                         artifact_id=artifact_id,
-                        known_workflow_stop_tokens=content_workflow_stop_tokens,
+                        known_workflow_resume_spans=(
+                            content_workflow_resume_spans.get(line_number, ())
+                        ),
                     )
                 )
         return findings

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import inspect
+import re
 import runpy
 import subprocess
 import sys
@@ -556,6 +557,426 @@ def test_paired_workflow_resume_token_is_not_private_host(
     assert json.loads(result.stdout)["findings"] == []
 
 
+def test_workflow_resume_pairing_preserves_marker_order() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    token = "face"
+    marker = ":" + ":" + token + ":" + ":"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + token
+    text = "\n".join((marker, stop_command, marker))
+    later_marker_start = text.rfind(marker)
+
+    paired_markers = module["paired_workflow_resume_markers"](text)
+    spans_by_line = module["workflow_resume_spans_by_line"](text)
+
+    assert paired_markers == (
+        (token, (later_marker_start, later_marker_start + len(marker))),
+    )
+    assert spans_by_line == {3: ((0, len(marker)),)}
+
+
+def test_repeated_workflow_stop_resume_pairs_preserve_sequence() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    token = "face"
+    marker = ":" + ":" + token + ":" + ":"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + token
+    text = "\n".join(
+        (stop_command, marker, marker, stop_command, marker)
+    )
+    marker_starts = [
+        match.start()
+        for match in re.finditer(re.escape(marker), text)
+    ]
+
+    paired_markers = module["paired_workflow_resume_markers"](text)
+
+    assert paired_markers == (
+        (token, (marker_starts[0], marker_starts[0] + len(marker))),
+        (token, (marker_starts[2], marker_starts[2] + len(marker))),
+    )
+
+
+def test_nested_workflow_stop_command_is_not_treated_as_active() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    first_token = "face"
+    nested_token = "cafe"
+    first_stop = ":" + ":" + "stop-commands" + ":" + ":" + first_token
+    nested_stop = ":" + ":" + "stop-commands" + ":" + ":" + nested_token
+    first_marker = ":" + ":" + first_token + ":" + ":"
+    nested_marker = ":" + ":" + nested_token + ":" + ":"
+    text = "\n".join(
+        (first_stop, nested_stop, first_marker, nested_marker)
+    )
+    first_marker_start = text.find(first_marker)
+
+    paired_markers = module["paired_workflow_resume_markers"](text)
+
+    assert paired_markers == (
+        (
+            first_token,
+            (
+                first_marker_start,
+                first_marker_start + len(first_marker),
+            ),
+        ),
+    )
+
+
+def test_resume_marker_prefix_is_not_reprocessed_as_stop_command() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    first_token = "stop-commands"
+    second_token = "face-token"
+    first_stop = ":" + ":" + "stop-commands" + ":" + ":" + first_token
+    apparent_second_stop = (
+        ":" + ":" + "stop-commands" + ":" + ":" + second_token
+    )
+    second_marker = ":" + ":" + second_token + ":" + ":"
+    text = "\n".join((first_stop, apparent_second_stop, second_marker))
+    resume_marker = ":" + ":" + first_token + ":" + ":"
+    resume_start = text.find(resume_marker, len(first_stop))
+
+    paired_markers = module["paired_workflow_resume_markers"](text)
+
+    assert paired_markers == (
+        (
+            first_token,
+            (resume_start, resume_start + len(resume_marker)),
+        ),
+    )
+
+
+def test_marker_inside_nested_stop_command_does_not_resume_commands() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    token = "face"
+    later_token = "face-token"
+    first_stop = ":" + ":" + "stop-commands" + ":" + ":" + token
+    nested_stop = (
+        ":" + ":" + "stop-commands" + ":" + ":" + "foo"
+        + ":" + ":" + token + ":" + ":"
+    )
+    apparent_later_stop = (
+        ":" + ":" + "stop-commands" + ":" + ":" + later_token
+    )
+    later_marker = ":" + ":" + later_token + ":" + ":"
+    actual_marker = ":" + ":" + token + ":" + ":"
+    text = "\n".join(
+        (
+            first_stop,
+            nested_stop,
+            apparent_later_stop,
+            later_marker,
+            actual_marker,
+        )
+    )
+    actual_marker_start = text.rfind(actual_marker)
+
+    paired_markers = module["paired_workflow_resume_markers"](text)
+
+    assert paired_markers == (
+        (
+            token,
+            (
+                actual_marker_start,
+                actual_marker_start + len(actual_marker),
+            ),
+        ),
+    )
+
+
+def test_stops_after_same_line_resume_marker_remain_inert() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    first_token = "stop-commands"
+    later_token = "face-token"
+    first_stop = ":" + ":" + "stop-commands" + ":" + ":" + first_token
+    inert_line = (
+        ":" + ":" + "stop-commands" + ":" + ":" + "ignored "
+        + ":" + ":" + "stop-commands" + ":" + ":" + later_token
+    )
+    later_marker = ":" + ":" + later_token + ":" + ":"
+    text = "\n".join((first_stop, inert_line, later_marker))
+    first_resume = ":" + ":" + first_token + ":" + ":"
+    first_resume_start = text.find(first_resume, len(first_stop))
+
+    paired_markers = module["paired_workflow_resume_markers"](text)
+
+    assert paired_markers == (
+        (
+            first_token,
+            (
+                first_resume_start,
+                first_resume_start + len(first_resume),
+            ),
+        ),
+    )
+
+
+def test_separate_quoted_output_can_resume_on_same_source_line(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    nested_stop = ":" + ":" + "stop-commands" + ":" + ":" + "nested"
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        "\n".join(
+            (
+                "# don't fail",
+                f'echo "{stop_command}"',
+                f'echo "{nested_stop}"; echo "{resume_marker}"',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: resume from separate output")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_multiple_quoted_arguments_are_one_output_segment(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    apparent_resume = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        f'echo "{stop_command}" "{apparent_resume}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit one inert output")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_printf_newline_arguments_are_separate_output_segments(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    nested_stop = ":" + ":" + "stop-commands" + ":" + ":" + "nested"
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        "\n".join(
+            (
+                f"printf '%s\\n' '{stop_command}'",
+                f"printf '%s\\n' '{nested_stop}' '{resume_marker}'",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: resume from printf output")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_printf_combined_arguments_are_one_output_segment(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    apparent_resume = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        f"printf '%s%s\\n' '{stop_command}' '{apparent_resume}'\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit combined printf output")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_printf_format_follows_command_not_environment_assignment(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    apparent_resume = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        "FMT='%s\\n' "
+        + f"printf '%s%s\\n' '{stop_command}' '{apparent_resume}'\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit assigned printf output")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_printf_adjacent_shell_fragments_are_one_argument(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    apparent_resume = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        f"printf '%s\\n' '{stop_command}'{apparent_resume}\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit adjacent printf fragments")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_printf_format_newlines_are_output_boundaries(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    nested_stop = ":" + ":" + "stop-commands" + ":" + ":" + "nested"
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        "printf '"
+        + stop_command
+        + "\\n"
+        + nested_stop
+        + "\\n"
+        + resume_marker
+        + "\\n'\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit printf format records")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_printf_format_boundary_lookup_remains_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + "ignored"
+    text = "printf '" + " ".join([stop_command] * 50_000) + "'"
+
+    started_at = time.perf_counter()
+    paired_markers = module["paired_workflow_resume_markers"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert paired_markers == ()
+
+
+def test_workflow_expression_operators_are_not_shell_boundaries(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    expression = "${{ a && b }}"
+    marker_value = "7-" + expression
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    apparent_resume = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        f"echo {stop_command} {apparent_resume}\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: emit one expression output")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_same_line_nested_workflow_stops_remain_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    first_stop = ":" + ":" + "stop-commands" + ":" + ":" + "face"
+    nested_stop = ":" + ":" + "stop-commands" + ":" + ":" + "ignored"
+    text = first_stop + "\n" + " ".join([nested_stop] * 50_000)
+
+    started_at = time.perf_counter()
+    paired_markers = module["paired_workflow_resume_markers"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert paired_markers == ()
+
+
+def test_committed_lone_carriage_return_cannot_hide_credential(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    secret = b"api_" + b"key = sk-" + b"A" * 24
+    unsafe_file = repo / "unsafe.txt"
+    unsafe_file.write_bytes(b"safe\r" + secret + b"\r")
+    git(repo, "add", "unsafe.txt")
+    git(repo, "commit", "-m", "add unsafe content")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "credential" for finding in findings)
+
+
+def test_untracked_carriage_return_workflow_pair_uses_same_line_mapping(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    marker_value = "7-marker"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_bytes(
+        (stop_command + "\r" + resume_marker + "\r").encode()
+    )
+
+    result = audit(repo, "HEAD")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
 def test_workflow_span_scan_remains_linear() -> None:
     module = runpy.run_path(str(SCRIPT))
     marker = ":" + ":" + "error" + ":" + ":"
@@ -622,7 +1043,7 @@ def test_repeated_valid_workflow_expressions_remain_linear() -> None:
     marker_value = "face-${{ x }}"
     stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
     resume_marker = ":" + ":" + marker_value + ":" + ":"
-    text = (stop_command + " " + resume_marker + " ") * 10_000
+    text = (stop_command + "\n" + resume_marker + "\n") * 10_000
 
     started_at = time.perf_counter()
     tokens = module["extract_workflow_stop_tokens"](text)
