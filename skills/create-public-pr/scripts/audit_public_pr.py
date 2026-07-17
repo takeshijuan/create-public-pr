@@ -43,6 +43,19 @@ IPV6_RE = re.compile(
     r"(?<![0-9A-Fa-f:])(\[?(?:[0-9A-Fa-f]{0,4}:){2,7}"
     r"[0-9A-Fa-f]{0,4}\]?)(?![0-9A-Fa-f:])"
 )
+WORKFLOW_COMMAND_PREFIX_RE = re.compile(
+    r":"
+    r":"
+    r"(?:add-mask|add-matcher|add-path|debug|echo|endgroup|error|group|notice|"
+    r"remove-matcher|save-state|set-env|set-output|stop-commands|warning)"
+    r"(?: [^:\r\n]*)?"
+    r":"
+    r":",
+    re.IGNORECASE,
+)
+WORKFLOW_RESUME_TOKEN_RE = re.compile(
+    r":" r":" r"[G-Zg-z_$-][A-Za-z0-9_${}-]*" r":" r":"
+)
 LOCAL_PATH_RE = re.compile(
     r"(?:(?i:file):///(?:[^\s/]+/)+[^\s/]+|"
     r"(?<![A-Za-z0-9_.~:/\\-])/(?:Users|(?i:home|root|tmp|private|var|etc|"
@@ -291,7 +304,34 @@ def scan_text(
             continue
         if address.is_private or address.is_loopback or address.is_link_local:
             categories.add("private-host")
+    workflow_command_spans = tuple(
+        match.span() for match in WORKFLOW_COMMAND_PREFIX_RE.finditer(text)
+    )
+    workflow_resume_spans = tuple(
+        match.span() for match in WORKFLOW_RESUME_TOKEN_RE.finditer(text)
+    )
     for match in IPV6_RE.finditer(text):
+        start, end = match.span(1)
+        if any(
+            span_start <= start and end <= span_end
+            for span_start, span_end in (
+                workflow_command_spans + workflow_resume_spans
+            )
+        ):
+            continue
+        try:
+            address = ipaddress.ip_address(match.group(1).strip("[]"))
+        except ValueError:
+            continue
+        if address.is_private or address.is_loopback or address.is_link_local:
+            categories.add("private-host")
+    ipv6_text = WORKFLOW_COMMAND_PREFIX_RE.sub(
+        lambda match: " " * len(match.group(0)), text
+    )
+    ipv6_text = WORKFLOW_RESUME_TOKEN_RE.sub(
+        lambda match: " " * len(match.group(0)), ipv6_text
+    )
+    for match in IPV6_RE.finditer(ipv6_text):
         try:
             address = ipaddress.ip_address(match.group(1).strip("[]"))
         except ValueError:

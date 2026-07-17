@@ -216,6 +216,191 @@ def test_detects_sensitive_added_content(
 
 
 @pytest.mark.parametrize(
+    "content",
+    [
+        'echo "::add-mask::sensitive value"',
+        'echo "::add-matcher::matcher.json"',
+        'echo "::add-path::tools/bin"',
+        'echo "::debug::diagnostic message"',
+        'echo "::error::required package path is missing"',
+        'echo "::warning file=ci.yml,line=1,col=1::check failed"',
+        'echo "::echo::on"',
+        'echo "::endgroup::"',
+        'echo "::group::build details"',
+        'echo "::notice::build completed"',
+        'echo "::remove-matcher owner=compiler::"',
+        'echo "::set-env name=MODE::release"',
+        'echo "::set-output name=result::ok"',
+        'echo "::save-state name=phase::done"',
+        'echo "::stop-commands::stopMarker"',
+        'echo "::WARNING::uppercase command"',
+        'echo "::resume-token::"',
+        'echo "::$stopMarker::"',
+        'echo "::${stopMarker}::"',
+    ],
+)
+def test_github_workflow_command_is_not_private_host(
+    tmp_path: Path, content: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(content + "\n", encoding="utf-8")
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add workflow annotation")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+def test_github_workflow_command_message_still_scans_private_host(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    private_ipv6 = "[" + "fd00" + ":" + ":" + "8]"
+    workflow.write_text(
+        f'echo "::error::backend returned {private_ipv6}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow annotation")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_github_workflow_command_unspaced_message_still_scans_private_host(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    private_ipv6 = "fd00" + ":" + ":" + "8"
+    workflow.write_text(
+        f'echo "::error::{private_ipv6}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow annotation")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "later_marker",
+    [
+        ":" + ":" + "error" + ":" + ":" + "message",
+        ":" + ":" + "resume-token" + ":" + ":",
+        ":" + ":" + "${stopMarker}" + ":" + ":",
+    ],
+)
+def test_workflow_command_property_private_ipv6_before_marker_is_detected(
+    tmp_path: Path, later_marker: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    private_ipv6 = "fd00" + ":" + ":" + "8"
+    workflow.write_text(
+        f'echo "::error title={private_ipv6} before {later_marker}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow annotation property")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        " before " + ":" + ":" + "error" + ":" + ":" + "message",
+        " before marker " + ":" + ":",
+    ],
+)
+def test_private_compressed_ipv6_before_later_marker_is_detected(
+    tmp_path: Path, suffix: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    private_ipv6 = ":" + ":" + "1"
+    workflow.write_text(
+        f'echo "{private_ipv6}{suffix}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow annotation")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "-label" + ":" + ":",
+        "_label" + ":" + ":",
+        "z" + ":" + ":",
+        "-label key=value" + ":" + ":",
+        "z key=value" + ":" + ":",
+    ],
+)
+def test_private_compressed_ipv6_with_token_suffix_is_detected(
+    tmp_path: Path, suffix: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    private_ipv6 = ":" + ":" + "1"
+    workflow.write_text(
+        f'echo "{private_ipv6}{suffix}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow annotation")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_exact_hex_resume_token_is_not_private_host(tmp_path: Path) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    resume_token = ":" + ":" + "face" + ":" + ":"
+    workflow.write_text(f'echo "{resume_token}"\n', encoding="utf-8")
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: resume workflow commands")
+
+    result = audit(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["findings"] == []
+
+
+@pytest.mark.parametrize(
     ("state", "source"),
     [
         ("committed", "committed-content"),
