@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import subprocess
+from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -43,6 +44,9 @@ IPV6_RE = re.compile(
     r"(?<![0-9A-Fa-f:])(\[?(?:[0-9A-Fa-f]{0,4}:){2,7}"
     r"[0-9A-Fa-f]{0,4}\]?)(?![0-9A-Fa-f:])"
 )
+HEX_COLON_RUN_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])([0-9A-Fa-f:]+)"
+)
 WORKFLOW_COMMAND_PREFIX_RE = re.compile(
     r":"
     r":"
@@ -53,8 +57,12 @@ WORKFLOW_COMMAND_PREFIX_RE = re.compile(
     r":",
     re.IGNORECASE,
 )
-WORKFLOW_RESUME_TOKEN_RE = re.compile(
-    r":" r":" r"[G-Zg-z_$-][A-Za-z0-9_${}-]*" r":" r":"
+WORKFLOW_STOP_COMMAND_PREFIX_RE = re.compile(
+    r":" r":" r"stop-commands" r":" r":",
+    re.IGNORECASE,
+)
+WORKFLOW_UNPAIRED_RESUME_TOKEN_RE = re.compile(
+    r":" r":" r"[G-Zg-z_$-][A-Za-z0-9_${}-]*" r":" r":",
 )
 LOCAL_PATH_RE = re.compile(
     r"(?:(?i:file):///(?:[^\s/]+/)+[^\s/]+|"
@@ -95,6 +103,142 @@ PUBLIC_IDENTIFIER_NUMBERS = {
     "UTF": frozenset({8, 16, 32}),
     "X9": frozenset({62}),
 }
+
+
+def private_ipv6_candidate(candidate: str) -> bool:
+    candidates = [candidate]
+    delimiter = ":" + ":"
+    if candidate.endswith(delimiter):
+        candidates.append(candidate[:-2])
+    if candidate.startswith(delimiter):
+        candidates.append(candidate[2:])
+    for value in candidates:
+        try:
+            address = ipaddress.ip_address(value.strip("[]"))
+        except ValueError:
+            continue
+        if address.is_private or address.is_loopback or address.is_link_local:
+            return True
+    return False
+
+
+def hex_colon_run_contains_private_ipv6(run: str) -> bool:
+    delimiter = ":" + ":"
+    split = run.find(delimiter)
+    while split != -1 and split <= 45:
+        if private_ipv6_candidate(run[:split]):
+            return True
+        split = run.find(delimiter, split + 1)
+    return False
+
+
+def workflow_token_contains_private_ipv6(token: str) -> bool:
+    if any(
+        private_ipv6_candidate(match.group(1)) for match in IPV6_RE.finditer(token)
+    ):
+        return True
+    return any(
+        hex_colon_run_contains_private_ipv6(match.group(1))
+        for match in HEX_COLON_RUN_RE.finditer(token)
+    )
+
+
+def parse_workflow_expression(text: str, start: int) -> tuple[int | None, int]:
+    cursor = start + 3
+    in_single_quote = False
+    while cursor < len(text):
+        character = text[cursor]
+        if character in {"\r", "\n"}:
+            return None, cursor
+        if character == "'":
+            if (
+                in_single_quote
+                and cursor + 1 < len(text)
+                and text[cursor + 1] == "'"
+            ):
+                cursor += 2
+                continue
+            in_single_quote = not in_single_quote
+            cursor += 1
+            continue
+        if not in_single_quote and text.startswith("}}", cursor):
+            return cursor + 2, cursor + 2
+        cursor += 1
+    return None, cursor
+
+
+def parse_workflow_token(text: str, start: int) -> tuple[str | None, int]:
+    cursor = start
+    while cursor < len(text):
+        if text.startswith("${{", cursor):
+            expression_end, failure_end = parse_workflow_expression(text, cursor)
+            if expression_end is None:
+                return None, failure_end
+            cursor = expression_end
+            continue
+        character = text[cursor]
+        if character == ":" or character.isspace() or character in {'"', "'"}:
+            break
+        cursor += 1
+    if cursor == start:
+        return None, cursor
+    return text[start:cursor], cursor
+
+
+def workflow_stop_commands(
+    text: str,
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    commands: list[tuple[str, tuple[int, int]]] = []
+    cursor = 0
+    while True:
+        match = WORKFLOW_STOP_COMMAND_PREFIX_RE.search(text, cursor)
+        if match is None:
+            break
+        token, end = parse_workflow_token(text, match.end())
+        if token is None:
+            cursor = max(match.end(), end)
+            continue
+        commands.append((token, (match.start(), end)))
+        cursor = max(match.end(), end)
+    return tuple(commands)
+
+
+def workflow_markers(text: str) -> tuple[tuple[str, tuple[int, int]], ...]:
+    delimiter = ":" + ":"
+    markers: list[tuple[str, tuple[int, int]]] = []
+    cursor = 0
+    while True:
+        start = text.find(delimiter, cursor)
+        if start == -1:
+            break
+        token, token_end = parse_workflow_token(
+            text, start + len(delimiter)
+        )
+        if token is not None and text.startswith(delimiter, token_end):
+            end = token_end + len(delimiter)
+            markers.append((token, (start, end)))
+            cursor = end
+            continue
+        cursor = max(start + len(delimiter), token_end)
+    return tuple(markers)
+
+
+def extract_workflow_stop_tokens(text: str) -> frozenset[str]:
+    first_stop_by_token: dict[str, int] = {}
+    for token, (start, _) in workflow_stop_commands(text):
+        first_stop_by_token.setdefault(token, start)
+    first_marker_by_token: dict[str, int] = {}
+    for token, (start, _) in workflow_markers(text):
+        first_marker_by_token.setdefault(token, start)
+    return frozenset(
+        token
+        for token, stop_position in first_stop_by_token.items()
+        if stop_position < first_marker_by_token.get(token, -1)
+        and not private_ipv6_candidate(":" + ":" + token + ":" + ":")
+        and not workflow_token_contains_private_ipv6(token)
+    )
+
+
 PUBLIC_ARTIFACT_CATEGORIES = frozenset({"credential", "private-host"})
 PUBLIC_ARTIFACT_REGULAR_MODES = frozenset({b"100644", b"100755"})
 PUBLIC_ARTIFACT_PATH_COMPONENTS = frozenset(
@@ -285,6 +429,7 @@ def scan_text(
     repo_identity: tuple[str, str, str] | None,
     commit: str | None = None,
     path: str | None = None,
+    known_workflow_stop_tokens: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     categories: set[str] = set()
     if PRIVATE_KEY_RE.search(text):
@@ -307,37 +452,73 @@ def scan_text(
     workflow_command_spans = tuple(
         match.span() for match in WORKFLOW_COMMAND_PREFIX_RE.finditer(text)
     )
+    workflow_stop_matches = workflow_stop_commands(text)
+    workflow_stop_spans = tuple(
+        span
+        for token, span in workflow_stop_matches
+        if not workflow_token_contains_private_ipv6(token)
+    )
+    stop_tokens = set(known_workflow_stop_tokens)
+    stop_tokens.update(extract_workflow_stop_tokens(text))
     workflow_resume_spans = tuple(
-        match.span() for match in WORKFLOW_RESUME_TOKEN_RE.finditer(text)
+        span for token, span in workflow_markers(text) if token in stop_tokens
     )
-    for match in IPV6_RE.finditer(text):
-        start, end = match.span(1)
-        if any(
-            span_start <= start and end <= span_end
-            for span_start, span_end in (
-                workflow_command_spans + workflow_resume_spans
-            )
-        ):
-            continue
-        try:
-            address = ipaddress.ip_address(match.group(1).strip("[]"))
-        except ValueError:
-            continue
-        if address.is_private or address.is_loopback or address.is_link_local:
-            categories.add("private-host")
-    ipv6_text = WORKFLOW_COMMAND_PREFIX_RE.sub(
-        lambda match: " " * len(match.group(0)), text
+    workflow_unpaired_resume_spans = tuple(
+        match.span()
+        for match in WORKFLOW_UNPAIRED_RESUME_TOKEN_RE.finditer(text)
     )
-    ipv6_text = WORKFLOW_RESUME_TOKEN_RE.sub(
-        lambda match: " " * len(match.group(0)), ipv6_text
+    workflow_spans: list[tuple[int, int]] = []
+    for start, end in sorted(
+        workflow_command_spans
+        + workflow_stop_spans
+        + workflow_resume_spans
+        + workflow_unpaired_resume_spans
+    ):
+        if workflow_spans and start <= workflow_spans[-1][1]:
+            previous_start, previous_end = workflow_spans[-1]
+            workflow_spans[-1] = (previous_start, max(previous_end, end))
+        else:
+            workflow_spans.append((start, end))
+
+    def evaluate_ipv6_matches(
+        matches: Iterable[re.Match[str]],
+        is_private: Callable[[str], bool] = private_ipv6_candidate,
+    ) -> None:
+        workflow_span_index = 0
+        for match in matches:
+            start, end = match.span(1)
+            while (
+                workflow_span_index < len(workflow_spans)
+                and workflow_spans[workflow_span_index][1] <= start
+            ):
+                workflow_span_index += 1
+            if (
+                workflow_span_index < len(workflow_spans)
+                and workflow_spans[workflow_span_index][0] <= start
+                and end <= workflow_spans[workflow_span_index][1]
+            ):
+                continue
+            if is_private(match.group(1)):
+                categories.add("private-host")
+
+    evaluate_ipv6_matches(IPV6_RE.finditer(text))
+    evaluate_ipv6_matches(
+        HEX_COLON_RUN_RE.finditer(text),
+        hex_colon_run_contains_private_ipv6,
     )
-    for match in IPV6_RE.finditer(ipv6_text):
-        try:
-            address = ipaddress.ip_address(match.group(1).strip("[]"))
-        except ValueError:
-            continue
-        if address.is_private or address.is_loopback or address.is_link_local:
-            categories.add("private-host")
+    ipv6_text_parts: list[str] = []
+    cursor = 0
+    for start, end in workflow_spans:
+        ipv6_text_parts.append(text[cursor:start])
+        ipv6_text_parts.append(" " * (end - start))
+        cursor = end
+    ipv6_text_parts.append(text[cursor:])
+    ipv6_text = "".join(ipv6_text_parts)
+    evaluate_ipv6_matches(IPV6_RE.finditer(ipv6_text))
+    evaluate_ipv6_matches(
+        HEX_COLON_RUN_RE.finditer(ipv6_text),
+        hex_colon_run_contains_private_ipv6,
+    )
     if not safe_shebang(text) and LOCAL_PATH_RE.search(text):
         categories.add("local-path")
     for match in EMAIL_RE.finditer(text):
@@ -398,6 +579,7 @@ def scan_content_text(
     commit: str | None = None,
     path: str,
     artifact_id: str | None = None,
+    known_workflow_stop_tokens: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     findings = scan_text(
         text,
@@ -406,6 +588,7 @@ def scan_content_text(
         repo_identity=repo_identity,
         commit=commit,
         path=path,
+        known_workflow_stop_tokens=known_workflow_stop_tokens,
     )
     if artifact_id is None or CREDENTIAL_TOKEN_RE.search(text):
         return findings
@@ -689,6 +872,9 @@ def scan_commits(
                         )
                     )
                 else:
+                    content_workflow_stop_tokens = extract_workflow_stop_tokens(
+                        blob.decode("utf-8", "replace")
+                    )
                     if len(parents) > 1:
                         content_lines = merge_added_lines(
                             repo, parents, commit, changed_path
@@ -732,6 +918,7 @@ def scan_commits(
                                 commit=commit,
                                 path=changed_path,
                                 artifact_id=artifact_id,
+                                known_workflow_stop_tokens=content_workflow_stop_tokens,
                             )
                         )
             message = git(repo, "show", "-s", "--format=%B", commit).stdout
@@ -926,6 +1113,7 @@ def scan_worktree(
                 ):
                     diff = git_bytes(repo, *diff_args, "--", path).stdout
                     artifact_id = None
+                    content_workflow_stop_tokens: frozenset[str] = frozenset()
                     if source == "staged-content" and diff:
                         index_entry = git_bytes(
                             repo, "ls-files", "--stage", "-z", "--", path
@@ -970,10 +1158,20 @@ def scan_worktree(
                                         path=path,
                                     )
                                 )
+                            else:
+                                content_workflow_stop_tokens = (
+                                    extract_workflow_stop_tokens(
+                                        index_blob.decode("utf-8", "replace")
+                                    )
+                                )
                     elif source == "worktree-content" and current_content is not None:
                         artifact_id = artifact_id_for_blob(
                             path, current_content, public_artifacts
                         )
+                        if b"\0" not in current_content[:8192]:
+                            content_workflow_stop_tokens = extract_workflow_stop_tokens(
+                                current_content.decode("utf-8", "replace")
+                            )
                     for line in added_lines(diff):
                         findings.extend(
                             scan_content_text(
@@ -983,6 +1181,7 @@ def scan_worktree(
                                 repo_identity=repo_identity,
                                 path=path,
                                 artifact_id=artifact_id,
+                                known_workflow_stop_tokens=content_workflow_stop_tokens,
                             )
                         )
             if link_component is not None:
@@ -1027,8 +1226,10 @@ def scan_worktree(
             if untracked:
                 content = current_content.decode("utf-8", "replace")
                 lines = content.splitlines()
+                content_workflow_stop_tokens = extract_workflow_stop_tokens(content)
             else:
                 lines = []
+                content_workflow_stop_tokens = frozenset()
             artifact_id = artifact_id_for_blob(path, current_content, public_artifacts)
             for line in lines:
                 findings.extend(
@@ -1039,6 +1240,7 @@ def scan_worktree(
                         repo_identity=repo_identity,
                         path=path,
                         artifact_id=artifact_id,
+                        known_workflow_stop_tokens=content_workflow_stop_tokens,
                     )
                 )
         return findings

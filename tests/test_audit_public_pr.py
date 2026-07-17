@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import inspect
+import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Callable
@@ -297,6 +299,144 @@ def test_github_workflow_command_unspaced_message_still_scans_private_host(
     assert any(finding["category"] == "private-host" for finding in findings)
 
 
+def test_github_workflow_command_property_delimiter_still_scans_private_host(
+    tmp_path: Path,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    private_ipv6 = "fd00" + ":" + ":" + "1"
+    workflow.write_text(
+        f'echo "::error title={private_ipv6}::message"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow annotation property")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("address_kind", "property_prefix", "message"),
+    [
+        ("loopback", True, "failed"),
+        ("loopback", False, "1failed"),
+        ("ula", True, "error"),
+        ("ula", False, "bad"),
+    ],
+)
+def test_expanded_private_ipv6_at_workflow_delimiter_is_detected(
+    tmp_path: Path,
+    address_kind: str,
+    property_prefix: bool,
+    message: str,
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    if address_kind == "loopback":
+        private_ipv6 = ":".join(["0"] * 7 + ["1"])
+    else:
+        private_ipv6 = "fd00:" + ":".join(["0"] * 6 + ["1"])
+    command_prefix = (
+        ":" + ":" + "error title="
+        if property_prefix
+        else ":" + ":" + "error" + ":" + ":"
+    )
+    delimiter = ":" + ":"
+    workflow.write_text(
+        f'echo "{command_prefix}{private_ipv6}{delimiter}{message}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe expanded workflow address")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("token", "stop_first"),
+    [
+        ("1", True),
+        ("1", False),
+        ("fd00", True),
+        ("fd00", False),
+        ("fc00", True),
+        ("fc00", False),
+        ("fe80", True),
+        ("fe80", False),
+    ],
+)
+def test_private_ipv6_marker_is_not_masked_by_matching_stop_token(
+    tmp_path: Path, token: str, stop_first: bool
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + token
+    private_marker = ":" + ":" + token + ":" + ":"
+    stop_line = f'echo "{stop_command}"'
+    marker_line = f'backend="{private_marker}"'
+    lines = [stop_line, marker_line] if stop_first else [marker_line, stop_line]
+    workflow.write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow marker")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "address_kind",
+    ["compressed-ula", "compressed-link-local", "expanded-ula", "expanded-loopback"],
+)
+def test_private_ipv6_inside_expression_token_is_not_masked(
+    tmp_path: Path, address_kind: str
+) -> None:
+    repo = initialize_repo(tmp_path)
+    workflow = repo / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    if address_kind == "compressed-ula":
+        private_ipv6 = "fd00" + ":" + ":" + "1"
+    elif address_kind == "compressed-link-local":
+        private_ipv6 = "fe80" + ":" + ":" + "1"
+    elif address_kind == "expanded-ula":
+        private_ipv6 = "fd00:" + ":".join(["0"] * 6 + ["1"])
+    else:
+        private_ipv6 = ":".join(["0"] * 7 + ["1"])
+    if address_kind.startswith("expanded"):
+        private_ipv6 += ":" + ":" + "x"
+    marker_value = "face-${{ '" + private_ipv6 + "' }}"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    workflow.write_text(
+        f'echo "{stop_command}"\necho "{resume_marker}"\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", ".github/workflows/ci.yml")
+    git(repo, "commit", "-m", "ci: add unsafe workflow expression")
+
+    result = audit(repo)
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)["findings"]
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
 @pytest.mark.parametrize(
     "later_marker",
     [
@@ -385,12 +525,28 @@ def test_private_compressed_ipv6_with_token_suffix_is_detected(
     assert any(finding["category"] == "private-host" for finding in findings)
 
 
-def test_exact_hex_resume_token_is_not_private_host(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "token",
+    [
+        "face-token",
+        "face-${GITHUB_RUN_ID}",
+        "face-${{ github.run_id }}",
+        "face-${{ format('}}-{0}', github.run_id) }}",
+        "7-token",
+    ],
+)
+def test_paired_workflow_resume_token_is_not_private_host(
+    tmp_path: Path, token: str
+) -> None:
     repo = initialize_repo(tmp_path)
     workflow = repo / ".github" / "workflows" / "ci.yml"
     workflow.parent.mkdir(parents=True)
-    resume_token = ":" + ":" + "face" + ":" + ":"
-    workflow.write_text(f'echo "{resume_token}"\n', encoding="utf-8")
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + token
+    resume_marker = ":" + ":" + token + ":" + ":"
+    workflow.write_text(
+        f'echo "{stop_command}"\necho "{resume_marker}"\n',
+        encoding="utf-8",
+    )
     git(repo, "add", ".github/workflows/ci.yml")
     git(repo, "commit", "-m", "ci: resume workflow commands")
 
@@ -398,6 +554,82 @@ def test_exact_hex_resume_token_is_not_private_host(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["findings"] == []
+
+
+def test_workflow_span_scan_remains_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    marker = ":" + ":" + "error" + ":" + ":"
+    private_ipv6 = "fd00" + ":" + ":" + "1"
+    text = " ".join([marker] * 5_000 + [private_ipv6] * 5_000)
+
+    started_at = time.perf_counter()
+    findings = module["scan_text"](
+        text,
+        profile="community",
+        source="performance-regression",
+        repo_identity=None,
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 5.0
+    assert any(finding["category"] == "private-host" for finding in findings)
+
+
+def test_malformed_workflow_expression_scan_remains_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":"
+    malformed_expression = "${{" + "a"
+    text = stop_command + malformed_expression * 10_000
+
+    started_at = time.perf_counter()
+    tokens = module["extract_workflow_stop_tokens"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert tokens == frozenset()
+
+
+def test_unterminated_workflow_marker_scan_remains_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    expression = "${{ x }}"
+    text = ":" + ":" + expression * 10_000 + ":x"
+
+    started_at = time.perf_counter()
+    tokens = module["extract_workflow_stop_tokens"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert tokens == frozenset()
+
+
+def test_repeated_malformed_workflow_prefixes_remain_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":"
+    malformed_stop = stop_command + "${{a "
+    malformed_marker = ":" + ":" + "${{a"
+    text = malformed_stop * 10_000 + malformed_marker * 10_000
+
+    started_at = time.perf_counter()
+    tokens = module["extract_workflow_stop_tokens"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert tokens == frozenset()
+
+
+def test_repeated_valid_workflow_expressions_remain_linear() -> None:
+    module = runpy.run_path(str(SCRIPT))
+    marker_value = "face-${{ x }}"
+    stop_command = ":" + ":" + "stop-commands" + ":" + ":" + marker_value
+    resume_marker = ":" + ":" + marker_value + ":" + ":"
+    text = (stop_command + " " + resume_marker + " ") * 10_000
+
+    started_at = time.perf_counter()
+    tokens = module["extract_workflow_stop_tokens"](text)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 3.0
+    assert tokens == frozenset({marker_value})
 
 
 @pytest.mark.parametrize(
