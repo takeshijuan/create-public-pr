@@ -6,6 +6,12 @@ The audit covers the current branch name, changed filenames, every commit in the
 
 Only the scanner may inspect potentially sensitive values. Reports expose category, severity, source kind, safe path identifier, safe commit identifier, and remediation. Never copy a match into terminal output, notes, a PR, or a review record.
 
+## Pre-existing history classification
+
+A repository-wide history finding is pre-existing only when its safe commit identifier is proven reachable from `origin/$base` and outside `origin/$base..HEAD`. The current PR publication delta contains every commit in `origin/$base..HEAD`, intended tracked and untracked worktree paths, and proposed title, body, and commit message. Unclassified or current-PR findings remain blocking.
+
+Accepting proven pre-existing contamination does not create a manual-review exception or suppress any finding in the current PR publication delta. Choosing to clean history first ends this skill without rewriting history; cleanup requires a separately authorized workflow and a fresh audit afterward. Changing the base or HEAD invalidates the classification and the user's prior choice. Throughout classification, matched values remain scanner-only and only safe identifiers may be handled.
+
 ## Profiles and outcomes
 
 Use `community` for ordinary OSS publication, including repositories described only as future-public. It marks an external repository link for review so its public status and relevance can be proven. Use `locked-down` only when repository instructions explicitly require no-external-links, no-internal-links, or an equivalent prohibition; every cross-repository link is then blocking.

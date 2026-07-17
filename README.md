@@ -26,6 +26,7 @@ npx --yes skills@1.5.17 add . --list
 
 - Confirmed public-repository PR requests, or explicit `create-public-pr` / public-safe opt-in. Ordinary private, internal, future-public, and unverified repositories use their normal PR workflow; review-only, commit-only, merge, issue, and deployment requests do not trigger it.
 - Complete history and worktree scanning without printing matched sensitive values.
+- A fail-closed two-choice gate for proven pre-existing history contamination: accept only the old contamination and audit the complete current PR publication delta, or leave the skill and clean history in a separately authorized workflow. The choice never waives current-PR findings and expires when the base or HEAD changes.
 - Exact staging, repository-local GitHub noreply identity, normal pushes, draft creation, and existing-PR refresh.
 - No implicit reviewers, labels, projects, milestones, merges, deployments, history rewrites, or force-pushes.
 - A `community` profile for ordinary OSS publication and a stricter `locked-down` profile only for explicit no-external-links or no-internal-links policies.

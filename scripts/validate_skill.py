@@ -41,6 +41,7 @@ EVALS_PATH = "skills/create-public-pr/evals/evals.json"
 REGISTRY_PATH = "skills.sh.json"
 README_PATH = "README.md"
 WORKFLOW_PATH = ".github/workflows/validate.yml"
+PRIVACY_POLICY_PATH = "skills/create-public-pr/references/privacy-policy.md"
 
 
 def read_text(repo: Path, relative_path: str, errors: list[str]) -> str:
@@ -156,6 +157,19 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
     for phrase in required_phrases[1:]:
         if phrase.lower() not in skill.lower():
             errors.append(f"workflow guidance missing: {phrase}")
+
+    history_choice_contract = (
+        "## Pre-existing history gate",
+        "reachable from `origin/$base`",
+        "outside the current `origin/$base..HEAD` publication delta",
+        "ask the user to choose exactly one",
+        "Accept the proven pre-existing contamination and audit only the current PR publication delta.",
+        "Stop this skill and clean repository history first in a separately authorized workflow.",
+        "never waives findings in the current PR publication delta",
+        "If the base or HEAD changes",
+    )
+    if not all(clause in skill for clause in history_choice_contract):
+        errors.append("pre-existing history choice gate is incomplete")
 
     scanner_options = (
         "--repo",
@@ -436,6 +450,20 @@ def validate_evals(repo: Path, errors: list[str]) -> None:
         for marker in pressure_markers
     ):
         errors.append("workflow-pressure eval expectations are incomplete")
+    history_choice_markers = (
+        "pre-existing contamination",
+        "asks the user to choose exactly one",
+        "audit only the current pr publication delta",
+        "clean history in a separately authorized workflow",
+        "does not select a choice",
+        "waive current-pr findings",
+        "base or head changes",
+    )
+    if not all(
+        marker in text_by_kind.get("workflow-pressure", "")
+        for marker in history_choice_markers
+    ):
+        errors.append("workflow-pressure history choice coverage is incomplete")
 
 
 def validate_registry(repo: Path, errors: list[str]) -> None:
@@ -453,6 +481,21 @@ def validate_registry(repo: Path, errors: list[str]) -> None:
     }
     if payload != expected:
         errors.append("skills.sh.json does not match the official grouped registry shape")
+
+
+def validate_privacy_policy(repo: Path, errors: list[str]) -> None:
+    policy = read_text(repo, PRIVACY_POLICY_PATH, errors)
+    history_policy_contract = (
+        "## Pre-existing history classification",
+        "reachable from `origin/$base`",
+        "outside `origin/$base..HEAD`",
+        "Unclassified or current-PR findings remain blocking",
+        "does not create a manual-review exception",
+        "ends this skill without rewriting history",
+        "Changing the base or HEAD invalidates",
+    )
+    if not all(clause in policy for clause in history_policy_contract):
+        errors.append("pre-existing history classification policy is incomplete")
 
 
 def validate_readme_and_ci(repo: Path, errors: list[str]) -> None:
@@ -482,6 +525,12 @@ def validate_readme_and_ci(repo: Path, errors: list[str]) -> None:
     )
     if routing_contract not in readme:
         errors.append("README repository visibility routing contract is incomplete")
+    history_choice_readme_contract = (
+        "A fail-closed two-choice gate for proven pre-existing history contamination",
+        "never waives current-PR findings and expires when the base or HEAD changes",
+    )
+    if not all(clause in readme for clause in history_choice_readme_contract):
+        errors.append("README pre-existing history choice contract is incomplete")
     beta_markers = (
         "## v0.1.0 beta limitations",
         "heuristic",
@@ -635,6 +684,7 @@ def validate(repo: Path) -> list[str]:
     validate_workflow_contract(skill, errors)
     validate_evals(repo, errors)
     validate_registry(repo, errors)
+    validate_privacy_policy(repo, errors)
     validate_readme_and_ci(repo, errors)
     validate_public_content(repo, errors)
     return sorted(set(errors))
