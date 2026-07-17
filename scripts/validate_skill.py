@@ -107,6 +107,16 @@ def validate_frontmatter_and_references(skill: str, errors: list[str]) -> None:
     for negative in ("review-only", "commit-only", "issue", "merge", "deployment"):
         if negative not in description.lower():
             errors.append(f"skill description lacks negative trigger: {negative}")
+    for routing_term in (
+        "confirmed public repository",
+        "explicitly asks",
+        "private",
+        "internal",
+        "future-public",
+        "unverified",
+    ):
+        if routing_term not in description.lower():
+            errors.append(f"skill description lacks routing policy: {routing_term}")
 
     references = set(re.findall(r"\((references/[a-z0-9-]+\.md)\)", skill))
     expected = {"references/privacy-policy.md", "references/pr-writing.md"}
@@ -242,6 +252,18 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
         errors.append("post-create PR verification fields are incomplete")
     if "gh auth status" not in skill:
         errors.append("GitHub authentication check is missing")
+    visibility_lookup = (
+        "visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2"
+    )
+    if visibility_lookup not in skill:
+        errors.append("live repository visibility lookup is missing")
+    for routing_clause in (
+        "A visibility lookup failure does not qualify the repository as public.",
+        "Explicit opt-in takes precedence over repository visibility.",
+        "Private, internal, future-public, and unverified repositories do not qualify automatically.",
+    ):
+        if routing_clause not in skill:
+            errors.append(f"workflow routing guidance missing: {routing_clause}")
     if "codex/<short-description>" not in skill:
         errors.append("default branch naming contract is missing")
     if "Conventional Commits" not in skill:
@@ -381,6 +403,25 @@ def validate_evals(repo: Path, errors: list[str]) -> None:
         for marker in negative_markers
     ):
         errors.append("routing-negative eval trigger coverage is incomplete")
+    routing_policy_markers = {
+        "routing-positive": (
+            "confirmed public",
+            "explicit opt-in",
+            "private repository",
+        ),
+        "routing-negative": (
+            "private repository",
+            "future-public",
+            "unverified",
+            "normal pr workflow",
+        ),
+    }
+    if any(
+        marker not in text_by_kind.get(kind, "")
+        for kind, markers in routing_policy_markers.items()
+        for marker in markers
+    ):
+        errors.append("repository visibility routing eval coverage is incomplete")
     pressure_markers = (
         "locked-down profile",
         "does not amend, rebase, reset, or force-push",
@@ -434,6 +475,13 @@ def validate_readme_and_ci(repo: Path, errors: list[str]) -> None:
     pinned = "npx --yes skills@1.5.17 add . --list"
     if pinned not in readme:
         errors.append("README must document the skills@1.5.17 CI pin")
+    routing_contract = (
+        "Confirmed public-repository PR requests, or explicit `create-public-pr` / "
+        "public-safe opt-in. Ordinary private, internal, future-public, and "
+        "unverified repositories use their normal PR workflow"
+    )
+    if routing_contract not in readme:
+        errors.append("README repository visibility routing contract is incomplete")
     beta_markers = (
         "## v0.1.0 beta limitations",
         "heuristic",
@@ -468,7 +516,7 @@ def validate_public_content(repo: Path, errors: list[str]) -> None:
         "node_modules",
         "htmlcov",
     }
-    excluded_files = {".coverage", ".DS_Store"}
+    excluded_files = {".git", ".coverage", ".DS_Store"}
     local_marker_pattern = re.compile(
         r"(?:^|[\s'\"(])/(?:"
         + r"Users|home"

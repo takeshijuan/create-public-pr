@@ -1,6 +1,6 @@
 ---
 name: create-public-pr
-description: Use when a user explicitly asks to create, open, prepare, publish, or refresh a public-safe pull request; do not use for review-only, local commit-only, issue, merge, or deployment requests.
+description: Use when a user asks to create, open, prepare, publish, or refresh a pull request in a confirmed public repository, or explicitly asks for create-public-pr or public-safe handling; do not use for ordinary private, internal, future-public, or unverified repositories, nor for review-only, local commit-only, issue, merge, or deployment requests.
 ---
 
 # Create Public PR
@@ -9,11 +9,13 @@ description: Use when a user explicitly asks to create, open, prepare, publish, 
 
 Create a new public-safe draft pull request, or safely refresh one existing pull request, only after its exact scope and complete branch history pass a redacting audit. A clean final diff is not enough: intermediate commits, identities, proposed PR text, binaries, symlinks, and intended worktree changes are all part of the boundary.
 
+Before entering the ordered workflow, require either live repository visibility confirmed as `PUBLIC` or explicit user opt-in to `create-public-pr` or public-safe handling. Without either signal, leave this skill and use the repository's normal PR workflow. Private, internal, future-public, and unverified repositories do not qualify automatically. A visibility lookup failure does not qualify the repository as public. Explicit opt-in takes precedence over repository visibility.
+
 Read [privacy-policy.md](references/privacy-policy.md) before resolving findings. Read [pr-writing.md](references/pr-writing.md) before drafting the title and body.
 
 ## Ordered contract
 
-1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, default base, working tree, existing branch commits, and any open PR for the head branch. Stop on detached HEAD, an ambiguous PR, an unexpected base, or incomplete repository access.
+1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, live repository visibility, default base, working tree, existing branch commits, and any open PR for the head branch. If the user did not explicitly opt in, require visibility `PUBLIC`; otherwise leave this skill for the normal PR workflow. Stop on detached HEAD, an ambiguous PR, an unexpected base, a failed visibility lookup without explicit opt-in, or incomplete repository access.
 2. **Scope.** Name the intended change and obtain an explicit path or hunk boundary. Treat staged and untracked content as observations, not authorization. If approved and unrelated changes are mixed, stop and confirm the exact scope; do not use stash, reset, restore, or destructive index manipulation to separate it without authorization.
 3. **Branch.** Enforce a focused non-default branch with only related commits. When the current branch is the base, create a branch using the repository convention or `codex/<short-description>`. Require the branch to differ from the base and `origin/$base` to be an ancestor of `HEAD`. If sensitive material exists in published history, do not amend, rebase, reset, or force-push. Stop before changing PR strategy; a clean replacement branch and replacement PR require explicit user authorization.
 4. **Prepare.** Follow the repository template. Write the title, body, commit message, confirmed repo-relative paths, audit output, and manual-review records to files inside `.git/`. Follow the repository's commit convention; when none exists, use Conventional Commits. Resolve the skill directory from the loaded `SKILL.md`; never assume the target repository contains the scanner. Use `community` for ordinary OSS publication, including repositories described only as future-public. Select `locked-down` only when repository instructions explicitly impose no-external-links, no-internal-links, or an equivalent prohibition.
@@ -47,6 +49,7 @@ cd "$repo_root" || exit 2
 branch=$(git branch --show-current)
 test -n "$branch" || exit 2
 gh auth status || exit 2
+visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2
 pr_count=$(gh pr list --head "$branch" --state open --json number --jq 'length') || exit 2
 case "$pr_count" in
   0) base=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name') || exit 2 ;;
