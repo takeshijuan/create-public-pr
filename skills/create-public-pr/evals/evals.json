@@ -38,6 +38,30 @@
       ]
     },
     {
+      "id": 10,
+      "kind": "routing-positive",
+      "prompt": "This GitHub repository is confirmed public. Create a pull request for the focused changes on this branch.",
+      "expected_output": "The skill loads for a confirmed public repository even though the user did not name the skill or request public-safe handling.",
+      "files": [],
+      "expectations": [
+        "Loads create-public-pr because live visibility is confirmed public",
+        "Follows the complete public PR safety workflow",
+        "Creates one verified draft only after all gates pass"
+      ]
+    },
+    {
+      "id": 11,
+      "kind": "routing-positive",
+      "prompt": "This is a private repository. Explicitly use create-public-pr to prepare a public-safe draft for the focused change.",
+      "expected_output": "The skill loads because explicit opt-in takes precedence over private repository visibility.",
+      "files": [],
+      "expectations": [
+        "Treats the request as an explicit opt-in",
+        "Does not reject the workflow solely because the repository is private",
+        "Applies every fail-closed public PR gate"
+      ]
+    },
+    {
       "id": 3,
       "kind": "routing-negative",
       "prompt": "Review this pull request and report any correctness issues. Do not change it.",
@@ -69,6 +93,42 @@
         "Issue-only, merge, and deployment requests do not load the skill",
         "Does not create or refresh a pull request",
         "Does not merge or deploy"
+      ]
+    },
+    {
+      "id": 12,
+      "kind": "routing-negative",
+      "prompt": "This is a private repository. Open a normal pull request for the focused change.",
+      "expected_output": "The skill does not load; the agent uses the repository's normal PR workflow.",
+      "files": [],
+      "expectations": [
+        "Does not treat an ordinary private repository as automatically public-safe",
+        "Uses the normal PR workflow",
+        "Does not invoke create-public-pr without explicit opt-in"
+      ]
+    },
+    {
+      "id": 13,
+      "kind": "routing-negative",
+      "prompt": "This private repository is future-public. Open a normal pull request for the focused change.",
+      "expected_output": "Future-public intent alone does not load the skill; the agent uses the normal PR workflow.",
+      "files": [],
+      "expectations": [
+        "Requires explicit opt-in while current visibility is private",
+        "Does not infer public visibility from future-public intent",
+        "Uses the normal PR workflow"
+      ]
+    },
+    {
+      "id": 14,
+      "kind": "routing-negative",
+      "prompt": "Repository visibility is unverified. Open a normal pull request for the focused change.",
+      "expected_output": "The skill does not load when visibility is unverified and there is no explicit opt-in.",
+      "files": [],
+      "expectations": [
+        "Does not guess that an unverified repository is public",
+        "Uses the normal PR workflow",
+        "Leaves create-public-pr unloaded"
       ]
     },
     {

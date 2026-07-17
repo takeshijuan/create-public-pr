@@ -24,7 +24,7 @@ npx --yes skills@1.5.17 add . --list
 
 ## What it enforces
 
-- Explicit public-PR requests only; review-only, commit-only, merge, issue, and deployment requests do not trigger it.
+- Confirmed public-repository PR requests, or explicit `create-public-pr` / public-safe opt-in. Ordinary private, internal, future-public, and unverified repositories use their normal PR workflow; review-only, commit-only, merge, issue, and deployment requests do not trigger it.
 - Complete history and worktree scanning without printing matched sensitive values.
 - Exact staging, repository-local GitHub noreply identity, normal pushes, draft creation, and existing-PR refresh.
 - No implicit reviewers, labels, projects, milestones, merges, deployments, history rewrites, or force-pushes.

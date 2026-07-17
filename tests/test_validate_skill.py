@@ -55,6 +55,19 @@ class SkillRepositoryValidationTests(unittest.TestCase):
         self.assertEqual(result.stdout, "skill validation: clean\n")
         self.assertEqual(result.stderr, "")
 
+    def test_worktree_git_pointer_is_not_public_content(self) -> None:
+        with self.copied_repository() as repo:
+            (repo / ".git").write_text(
+                "gitdir: /example/worktrees/create-public-pr\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_validator(repo)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "skill validation: clean\n")
+            self.assertEqual(result.stderr, "")
+
     def test_missing_required_public_file_is_rejected(self) -> None:
         with self.copied_repository() as repo:
             (repo / "SECURITY.md").unlink()
@@ -79,6 +92,31 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             evals_path.write_text(json.dumps(payload), encoding="utf-8")
 
             self.assert_invalid(repo, "evals require routing-negative cases")
+
+    def test_frontmatter_requires_repository_visibility_routing(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/SKILL.md",
+                "confirmed public repository",
+                "repository",
+            )
+
+            self.assert_invalid(
+                repo,
+                "skill description lacks routing policy: confirmed public repository",
+            )
+
+    def test_workflow_requires_live_visibility_lookup(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/SKILL.md",
+                "visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2",
+                "visibility=UNKNOWN",
+            )
+
+            self.assert_invalid(repo, "live repository visibility lookup is missing")
 
     def test_pr_creation_must_be_draft(self) -> None:
         with self.copied_repository() as repo:
@@ -424,10 +462,15 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             evals_path = repo / "skills/create-public-pr/evals/evals.json"
             payload = json.loads(evals_path.read_text(encoding="utf-8"))
             replacements = {
-                "routing-positive": (("create", "make"), ("publish", "share")),
+                "routing-positive": (
+                    ("create", "make"),
+                    ("publish", "share"),
+                    ("confirmed public", "known repository"),
+                ),
                 "routing-negative": (
                     ("issue-only", "other"),
                     ("deployment", "release"),
+                    ("future-public", "later repository"),
                 ),
                 "workflow-pressure": (
                     ("one-to-one audit/review comparator", "manual review"),
@@ -452,7 +495,22 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("routing-positive eval trigger coverage is incomplete", result.stdout)
             self.assertIn("routing-negative eval trigger coverage is incomplete", result.stdout)
+            self.assertIn("repository visibility routing eval coverage is incomplete", result.stdout)
             self.assertIn("workflow-pressure eval expectations are incomplete", result.stdout)
+
+    def test_readme_documents_repository_visibility_routing(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "README.md",
+                "Confirmed public-repository PR requests",
+                "Public PR requests",
+            )
+
+            self.assert_invalid(
+                repo,
+                "README repository visibility routing contract is incomplete",
+            )
 
     def test_readme_uses_official_repository_and_badge(self) -> None:
         with self.copied_repository() as repo:
