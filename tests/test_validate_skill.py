@@ -93,6 +93,141 @@ class SkillRepositoryValidationTests(unittest.TestCase):
 
             self.assert_invalid(repo, "evals require routing-negative cases")
 
+    def test_skill_defines_fail_closed_preexisting_history_choice_gate(self) -> None:
+        skill = (REPO_ROOT / "skills/create-public-pr/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        for contract in (
+            "## Pre-existing history gate",
+            "reachable from `origin/$base`",
+            "outside the current `origin/$base..HEAD` publication delta",
+            "ask the user to choose exactly one",
+            "Accept the proven pre-existing contamination and audit only the current PR publication delta.",
+            "Stop this skill and clean repository history first in a separately authorized workflow.",
+            "never waives findings in the current PR publication delta",
+            "If the base or HEAD changes",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, skill)
+
+    def test_validator_requires_preexisting_history_choice_gate(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/SKILL.md",
+                "## Pre-existing history gate",
+                "## History review",
+            )
+
+            self.assert_invalid(
+                repo, "pre-existing history choice gate is incomplete"
+            )
+
+    def test_privacy_policy_separates_preexisting_and_current_pr_findings(self) -> None:
+        policy = (
+            REPO_ROOT / "skills/create-public-pr/references/privacy-policy.md"
+        ).read_text(encoding="utf-8")
+
+        for contract in (
+            "## Pre-existing history classification",
+            "reachable from `origin/$base`",
+            "outside `origin/$base..HEAD`",
+            "Unclassified or current-PR findings remain blocking",
+            "does not create a manual-review exception",
+            "ends this skill without rewriting history",
+            "Changing the base or HEAD invalidates",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, policy)
+
+    def test_validator_requires_preexisting_history_policy(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "skills/create-public-pr/references/privacy-policy.md",
+                "## Pre-existing history classification",
+                "## History classification",
+            )
+
+            self.assert_invalid(
+                repo, "pre-existing history classification policy is incomplete"
+            )
+
+    def test_evals_cover_preexisting_history_choice_gate(self) -> None:
+        payload = json.loads(
+            (
+                REPO_ROOT / "skills/create-public-pr/evals/evals.json"
+            ).read_text(encoding="utf-8")
+        )
+        history_cases = [
+            case
+            for case in payload["evals"]
+            if case["kind"] == "workflow-pressure"
+            and "pre-existing contamination" in (
+                " ".join(
+                    [case["prompt"], case["expected_output"], *case["expectations"]]
+                ).lower()
+            )
+        ]
+
+        self.assertEqual(len(history_cases), 1)
+        case_text = " ".join(
+            [
+                history_cases[0]["prompt"],
+                history_cases[0]["expected_output"],
+                *history_cases[0]["expectations"],
+            ]
+        ).lower()
+        for contract in (
+            "asks the user to choose exactly one",
+            "audit only the current pr publication delta",
+            "clean history in a separately authorized workflow",
+            "does not select a choice",
+            "waive current-pr findings",
+            "base or head changes",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, case_text)
+
+    def test_validator_requires_preexisting_history_eval_coverage(self) -> None:
+        with self.copied_repository() as repo:
+            evals_path = repo / "skills/create-public-pr/evals/evals.json"
+            payload = json.loads(evals_path.read_text(encoding="utf-8"))
+            payload["evals"] = [
+                case for case in payload["evals"] if case["id"] != 15
+            ]
+            evals_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            self.assert_invalid(
+                repo, "workflow-pressure history choice coverage is incomplete"
+            )
+
+    def test_readme_documents_preexisting_history_choice_gate(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "A fail-closed two-choice gate for proven pre-existing history contamination",
+            readme,
+        )
+        self.assertIn(
+            "never waives current-PR findings and expires when the base or HEAD changes",
+            readme,
+        )
+
+    def test_validator_requires_readme_history_choice_documentation(self) -> None:
+        with self.copied_repository() as repo:
+            self.replace(
+                repo,
+                "README.md",
+                "A fail-closed two-choice gate for proven pre-existing history contamination",
+                "A history review gate",
+            )
+
+            self.assert_invalid(
+                repo, "README pre-existing history choice contract is incomplete"
+            )
+
     def test_frontmatter_requires_repository_visibility_routing(self) -> None:
         with self.copied_repository() as repo:
             self.replace(

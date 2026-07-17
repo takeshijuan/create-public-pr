@@ -13,6 +13,17 @@ Before entering the ordered workflow, require either live repository visibility 
 
 Read [privacy-policy.md](references/privacy-policy.md) before resolving findings. Read [pr-writing.md](references/pr-writing.md) before drafting the title and body.
 
+## Pre-existing history gate
+
+Pre-existing requires a safe commit proven reachable from `origin/$base` and outside the current `origin/$base..HEAD` publication delta. Everything else is current and blocking.
+
+On proven pre-existing contamination, stop all mutation and ask the user to choose exactly one:
+
+- **Option A — accept existing history.** Accept the proven pre-existing contamination and audit only the current PR publication delta.
+- **Option B — clean history first.** Stop this skill and clean repository history first in a separately authorized workflow.
+
+The first choice never waives findings in the current PR publication delta; scan every surface below. Option B authorizes no rewrite. Never choose implicitly or reveal values. If the base or HEAD changes, discard the choice and rerun.
+
 ## Ordered contract
 
 1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, live repository visibility, default base, working tree, existing branch commits, and any open PR for the head branch. If the user did not explicitly opt in, require visibility `PUBLIC`; otherwise leave this skill for the normal PR workflow. Stop on detached HEAD, an ambiguous PR, an unexpected base, a failed visibility lookup without explicit opt-in, or incomplete repository access.
