@@ -58,7 +58,7 @@ class SkillRepositoryValidationTests(unittest.TestCase):
     def test_worktree_git_pointer_is_not_public_content(self) -> None:
         with self.copied_repository() as repo:
             (repo / ".git").write_text(
-                "gitdir: /example/worktrees/create-public-pr\n",
+                "gitdir: /" + "Users/example/worktrees/create-public-pr\n",
                 encoding="utf-8",
             )
 
