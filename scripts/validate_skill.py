@@ -267,7 +267,7 @@ def validate_workflow_contract(skill: str, errors: list[str]) -> None:
     if "gh auth status" not in skill:
         errors.append("GitHub authentication check is missing")
     visibility_lookup = (
-        "visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2"
+        "visibility=$(gh repo view --json visibility --jq '.visibility') || visibility=LOOKUP_FAILED"
     )
     if visibility_lookup not in skill:
         errors.append("live repository visibility lookup is missing")

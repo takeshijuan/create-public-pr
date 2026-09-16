@@ -247,7 +247,7 @@ class SkillRepositoryValidationTests(unittest.TestCase):
             self.replace(
                 repo,
                 "skills/create-public-pr/SKILL.md",
-                "visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2",
+                "visibility=$(gh repo view --json visibility --jq '.visibility') || visibility=LOOKUP_FAILED",
                 "visibility=UNKNOWN",
             )
 

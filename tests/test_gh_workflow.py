@@ -152,7 +152,7 @@ gh() {
             ("INTERNAL", 0, None, 3),
             ("UNKNOWN", 0, None, 3),
             ("", 0, None, 3),
-            ("PUBLIC", 1, None, 2),
+            ("PUBLIC", 1, None, 3),
             ("PRIVATE", 0, "true", 0),
             ("PUBLIC", 0, "true", 0),
             ("UNKNOWN", 0, "true", 0),
@@ -172,6 +172,8 @@ gh() {
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertEqual("WORKFLOW_ENTERED" in result.stdout, expected == 0)
+                if expected == 3:
+                    self.assertIn("Use the normal PR workflow.", result.stdout)
 
     def test_create_block_creates_draft_with_explicit_fields_and_verifies(self) -> None:
         calls = self.run_documented_path("create")

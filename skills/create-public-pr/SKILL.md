@@ -54,7 +54,7 @@ The first choice never waives findings in the current PR publication delta; scan
 
 ## Complete adaptable command sequence
 
-Replace placeholders with confirmed repository-relative paths and branch slug. Before running the sequence, set `CREATE_PUBLIC_PR_PROFILE` to the profile selected in step 4. Set `CREATE_PUBLIC_PR_EXPLICIT_OPT_IN=true` only for explicit opt-in; otherwise unset it. Exit 3 or failed visibility lookup returns to normal handling; failed access remains unverified. Keep proposals under `.git/`.
+Replace placeholders with confirmed repository-relative paths and branch slug. Before running the sequence, set `CREATE_PUBLIC_PR_PROFILE` to the profile selected in step 4. Set `CREATE_PUBLIC_PR_EXPLICIT_OPT_IN=true` only for explicit opt-in; otherwise unset it. Exit 3 returns to normal handling; explicit opt-in with failed access exits 2. Keep proposals under `.git/`.
 
 ```bash
 repo_root=$(git rev-parse --show-toplevel) || exit 2
@@ -62,8 +62,9 @@ cd "$repo_root" || exit 2
 branch=$(git branch --show-current)
 test -n "$branch" || exit 2
 gh auth status || exit 2
-visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2
+visibility=$(gh repo view --json visibility --jq '.visibility') || visibility=LOOKUP_FAILED
 case "${CREATE_PUBLIC_PR_EXPLICIT_OPT_IN:-false}:$visibility" in
+  true:LOOKUP_FAILED) exit 2 ;;
   true:*|false:PUBLIC) ;;
   false:*) printf '%s\n' 'Use the normal PR workflow.'; exit 3 ;;
   *) exit 2 ;;
