@@ -128,6 +128,51 @@ class DocumentedGhWorkflowTests(unittest.TestCase):
                 f"documented gh call passed {option}",
             )
 
+    def test_visibility_gate_before_workflow(self) -> None:
+        prefix = self.skill.split("```bash\n", 1)[1].split("pr_count=", 1)[0]
+        stubs = '''
+git() {
+  case "$*" in
+    'rev-parse --show-toplevel') printf '%s\\n' "$PWD" ;;
+    'branch --show-current') printf '%s\\n' 'topic' ;;
+    *) exit 99 ;;
+  esac
+}
+gh() {
+  case "$1 $2" in
+    'auth status') return 0 ;;
+    'repo view') printf '%s\\n' "$TEST_VISIBILITY"; return "$TEST_LOOKUP_STATUS" ;;
+    *) exit 99 ;;
+  esac
+}
+'''
+        cases = [
+            ("PUBLIC", 0, None, 0),
+            ("PRIVATE", 0, None, 3),
+            ("INTERNAL", 0, None, 3),
+            ("UNKNOWN", 0, None, 3),
+            ("", 0, None, 3),
+            ("PUBLIC", 1, None, 2),
+            ("PRIVATE", 0, "true", 0),
+            ("PUBLIC", 0, "true", 0),
+            ("UNKNOWN", 0, "true", 0),
+            ("PUBLIC", 1, "true", 2),
+            ("PRIVATE", 0, "yes", 2),
+        ]
+        for visibility, lookup_status, opt_in, expected in cases:
+            with self.subTest(visibility=visibility, lookup_status=lookup_status, opt_in=opt_in):
+                environment = os.environ.copy()
+                environment.pop("CREATE_PUBLIC_PR_EXPLICIT_OPT_IN", None)
+                environment.update(TEST_VISIBILITY=visibility, TEST_LOOKUP_STATUS=str(lookup_status))
+                if opt_in is not None:
+                    environment["CREATE_PUBLIC_PR_EXPLICIT_OPT_IN"] = opt_in
+                result = subprocess.run(
+                    ["bash", "-eu", "-c", stubs + prefix + "printf 'WORKFLOW_ENTERED\\n'"],
+                    text=True, capture_output=True, env=environment,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual("WORKFLOW_ENTERED" in result.stdout, expected == 0)
+
     def test_create_block_creates_draft_with_explicit_fields_and_verifies(self) -> None:
         calls = self.run_documented_path("create")
         body_file = calls[0][-1]
