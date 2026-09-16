@@ -34,6 +34,8 @@ npx --yes skills@1.5.17 add . --list
 
 The scanner uses only the Python standard library at runtime and supports Python 3.10 and newer.
 
+Visibility must be checked before announcing use or starting audit gates. A generic “create a PR and deploy” request, an auto-loaded skill attachment, or a question/fix request about this skill is not explicit opt-in. The command sequence also exits before PR discovery or mutation unless visibility is `PUBLIC` or `CREATE_PUBLIC_PR_EXPLICIT_OPT_IN=true` records an actual user instruction for that PR.
+
 ## v0.1.0 beta limitations
 
 This release is a beta with deliberately conservative stop conditions.

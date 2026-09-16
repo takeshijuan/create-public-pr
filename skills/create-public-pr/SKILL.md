@@ -1,15 +1,17 @@
 ---
 name: create-public-pr
-description: Use when a user asks to create, open, prepare, publish, or refresh a pull request in a confirmed public repository, or explicitly asks for create-public-pr or public-safe handling; do not use for ordinary private, internal, future-public, or unverified repositories, nor for review-only, local commit-only, issue, merge, or deployment requests.
+description: Use when the user asks to create, open, prepare, publish, or refresh a PR in a live-confirmed public repository, or explicitly asks to use create-public-pr or public-safe handling for that PR. Check visibility before announcing use. Private, internal, future-public, and unverified repositories otherwise use normal PR handling. Excludes skill-only discussion or repair, review-only, commit-only, issue, merge, and deployment requests.
 ---
 
 # Create Public PR
 
-## Overview
+## Activation gate — before announcing use
 
-Create a new public-safe draft pull request, or safely refresh one existing pull request, only after its exact scope and complete branch history pass a redacting audit. A clean final diff is not enough: intermediate commits, identities, proposed PR text, binaries, symlinks, and intended worktree changes are all part of the boundary.
+Require a PR creation or refresh task. Mentioning, quoting, attaching, questioning, or editing this skill is not an instruction to run its PR workflow. “PR作って本番反映して” alone is not public-safe opt-in.
 
-Before entering the ordered workflow, require either live repository visibility confirmed as `PUBLIC` or explicit user opt-in to `create-public-pr` or public-safe handling. Without either signal, leave this skill and use the repository's normal PR workflow. Private, internal, future-public, and unverified repositories do not qualify automatically. A visibility lookup failure does not qualify the repository as public. Explicit opt-in takes precedence over repository visibility.
+Explicit opt-in means an operative user instruction to use this skill or public-safe handling for the target PR. Otherwise verify the target repository’s live visibility before announcing use, loading references, or applying workflow gates; auto-loading is not activation.
+
+Require live visibility `PUBLIC` or explicit opt-in. Otherwise use the normal PR workflow without public-audit scope or history-choice questions. Private, internal, future-public, and unverified repositories do not qualify automatically. A visibility lookup failure does not qualify the repository as public. Explicit opt-in takes precedence over repository visibility.
 
 Read [privacy-policy.md](references/privacy-policy.md) before resolving findings. Read [pr-writing.md](references/pr-writing.md) before drafting the title and body.
 
@@ -26,7 +28,7 @@ The first choice never waives findings in the current PR publication delta; scan
 
 ## Ordered contract
 
-1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, live repository visibility, default base, working tree, existing branch commits, and any open PR for the head branch. If the user did not explicitly opt in, require visibility `PUBLIC`; otherwise leave this skill for the normal PR workflow. Stop on detached HEAD, an ambiguous PR, an unexpected base, a failed visibility lookup without explicit opt-in, or incomplete repository access.
+1. **Inspect.** Read repository instructions and PR templates. Resolve the repository root, current branch, remote, authentication state, live repository visibility, default base, working tree, existing branch commits, and any open PR for the head branch. Stop on detached HEAD, an ambiguous PR, an unexpected base, or incomplete repository access. Opt-in does not waive access checks.
 2. **Scope.** Name the intended change and obtain an explicit path or hunk boundary. Treat staged and untracked content as observations, not authorization. If approved and unrelated changes are mixed, stop and confirm the exact scope; do not use stash, reset, restore, or destructive index manipulation to separate it without authorization.
 3. **Branch.** Enforce a focused non-default branch with only related commits. When the current branch is the base, create a branch using the repository convention or `codex/<short-description>`. Require the branch to differ from the base and `origin/$base` to be an ancestor of `HEAD`. If sensitive material exists in published history, do not amend, rebase, reset, or force-push. Stop before changing PR strategy; a clean replacement branch and replacement PR require explicit user authorization.
 4. **Prepare.** Follow the repository template. Write the title, body, commit message, confirmed repo-relative paths, audit output, and manual-review records to files inside `.git/`. Follow the repository's commit convention; when none exists, use Conventional Commits. Resolve the skill directory from the loaded `SKILL.md`; never assume the target repository contains the scanner. Use `community` for ordinary OSS publication, including repositories described only as future-public. Select `locked-down` only when repository instructions explicitly impose no-external-links, no-internal-links, or an equivalent prohibition.
@@ -52,7 +54,7 @@ The first choice never waives findings in the current PR publication delta; scan
 
 ## Complete adaptable command sequence
 
-Replace the angle-bracket path lists with the confirmed repository-relative paths and replace `short-description` with the focused branch slug. Before running the sequence, set `CREATE_PUBLIC_PR_PROFILE` to the profile selected in step 4. Keep proposal files under `.git/` so they cannot be committed accidentally.
+Replace placeholders with confirmed repository-relative paths and branch slug. Before running the sequence, set `CREATE_PUBLIC_PR_PROFILE` to the profile selected in step 4. Set `CREATE_PUBLIC_PR_EXPLICIT_OPT_IN=true` only for explicit opt-in; otherwise unset it. Exit 3 or failed visibility lookup returns to normal handling; failed access remains unverified. Keep proposals under `.git/`.
 
 ```bash
 repo_root=$(git rev-parse --show-toplevel) || exit 2
@@ -61,6 +63,11 @@ branch=$(git branch --show-current)
 test -n "$branch" || exit 2
 gh auth status || exit 2
 visibility=$(gh repo view --json visibility --jq '.visibility') || exit 2
+case "${CREATE_PUBLIC_PR_EXPLICIT_OPT_IN:-false}:$visibility" in
+  true:*|false:PUBLIC) ;;
+  false:*) printf '%s\n' 'Use the normal PR workflow.'; exit 3 ;;
+  *) exit 2 ;;
+esac
 pr_count=$(gh pr list --head "$branch" --state open --json number --jq 'length') || exit 2
 case "$pr_count" in
   0) base=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name') || exit 2 ;;
